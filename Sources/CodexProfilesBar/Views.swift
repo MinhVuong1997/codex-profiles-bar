@@ -169,6 +169,17 @@ struct MenuBarRootView: View {
                 .transition(.scale(scale: 0.96).combined(with: .opacity))
                 .zIndex(2)
             }
+
+            if let prompt = model.codexRelaunchPrompt {
+                CodexRelaunchOverlay(model: model, prompt: prompt) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                        model.dismissCodexRelaunchPrompt()
+                    }
+                }
+                .padding(14)
+                .transition(.scale(scale: 0.96).combined(with: .opacity))
+                .zIndex(2)
+            }
         }
         .animation(.spring(response: 0.32, dampingFraction: 0.84), value: model.banner?.id)
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: showDoctorSheet)
@@ -213,6 +224,7 @@ struct MenuBarRootView: View {
         if labelEditorTarget != nil { return "label" }
         if deleteTarget != nil { return "delete" }
         if switchTarget != nil { return "switch" }
+        if model.codexRelaunchPrompt != nil { return "relaunch" }
         return nil
     }
 
@@ -224,6 +236,8 @@ struct MenuBarRootView: View {
                 deleteTarget = nil
             } else if labelEditorTarget != nil {
                 labelEditorTarget = nil
+            } else if model.codexRelaunchPrompt != nil {
+                model.dismissCodexRelaunchPrompt()
             } else if showSaveSheet {
                 showSaveSheet = false
             } else if showDoctorSheet {
@@ -1116,6 +1130,57 @@ struct UnsavedSwitchOverlay: View {
     }
 }
 
+struct CodexRelaunchOverlay: View {
+    @ObservedObject var model: CodexProfilesViewModel
+    let prompt: CodexRelaunchPrompt
+    let onClose: () -> Void
+
+    var body: some View {
+        OverlayCard {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Reopen Codex now?")
+                    .font(.system(.title3, design: .rounded, weight: .bold))
+
+                Text("The profile has been switched to \(prompt.profileName). Reopening Codex will make the new profile available right away.")
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Button("Later") {
+                        onClose()
+                    }
+                    .disabled(model.isRestartingCodex)
+
+                    Spacer()
+
+                    Button(action: {
+                        Task {
+                            let didRestart = await model.restartCodex()
+                            await MainActor.run {
+                                if didRestart {
+                                    onClose()
+                                }
+                            }
+                        }
+                    }) {
+                        HStack(spacing: 8) {
+                            if model.isRestartingCodex {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(.white)
+                            }
+                            Text(model.isRestartingCodex ? "Reopening…" : "Reopen Codex")
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.isRestartingCodex)
+                }
+                .animation(.easeInOut(duration: 0.18), value: model.isRestartingCodex)
+            }
+            .frame(width: 356)
+        }
+    }
+}
+
 struct OverlayCard<Content: View>: View {
     @ViewBuilder let content: Content
 
@@ -1239,6 +1304,7 @@ struct SettingsView: View {
     @ObservedObject var model: CodexProfilesViewModel
     @AppStorage(Preferences.showIDsKey) private var showIDs = false
     @AppStorage(Preferences.autoRefreshKey) private var autoRefreshEnabled = true
+    @AppStorage(Preferences.promptReopenCodexKey) private var promptReopenCodex = true
 
     var body: some View {
         ZStack {
@@ -1363,6 +1429,17 @@ struct SettingsView: View {
                         Text("Refresh usage automatically every minute")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                         Text("Keeps usage and status fresh while the app is running.")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(Color(red: 0.40, green: 0.44, blue: 0.52))
+                    }
+                }
+                .toggleStyle(.switch)
+
+                Toggle(isOn: $promptReopenCodex) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Ask to reopen Codex after switching")
+                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                        Text("Shows a prompt after profile switches so the new session can be used right away.")
                             .font(.system(.caption, design: .rounded))
                             .foregroundStyle(Color(red: 0.40, green: 0.44, blue: 0.52))
                     }

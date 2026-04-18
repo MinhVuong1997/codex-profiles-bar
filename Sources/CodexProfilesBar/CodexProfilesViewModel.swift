@@ -24,6 +24,8 @@ final class CodexProfilesViewModel: ObservableObject {
     @Published private(set) var isRefreshingProfiles = false
     @Published private(set) var isAutoRefreshEnabled: Bool
     @Published private(set) var switchingProfileID: String?
+    @Published private(set) var codexRelaunchPrompt: CodexRelaunchPrompt?
+    @Published private(set) var isRestartingCodex = false
     @Published private(set) var lastRefresh: Date?
     @Published var banner: BannerMessage?
 
@@ -181,6 +183,10 @@ final class CodexProfilesViewModel: ObservableObject {
             try await service.loadProfile(id: id, mode: mode)
             applyOptimisticSwitch(to: profile)
             showBanner(title: "Profile switched", body: "Now using \(profile.primaryText).", tone: .success)
+            let shouldPromptReopen = UserDefaults.standard.object(forKey: Preferences.promptReopenCodexKey) as? Bool ?? true
+            if shouldPromptReopen {
+                codexRelaunchPrompt = CodexRelaunchPrompt(profileName: profile.primaryText)
+            }
             queueSwitchReconcile(for: profile, mode: mode)
             return true
         } catch {
@@ -538,6 +544,34 @@ final class CodexProfilesViewModel: ObservableObject {
         banner = nil
     }
 
+    func dismissCodexRelaunchPrompt() {
+        codexRelaunchPrompt = nil
+    }
+
+    @discardableResult
+    func restartCodex() async -> Bool {
+        isRestartingCodex = true
+        defer { isRestartingCodex = false }
+
+        do {
+            try await restartCodexApplication()
+            codexRelaunchPrompt = nil
+            showBanner(
+                title: "Codex reopened",
+                body: "Codex has been reopened with the latest local profile state.",
+                tone: .success
+            )
+            return true
+        } catch {
+            showBanner(
+                title: "Could not reopen Codex",
+                body: error.localizedDescription,
+                tone: .error
+            )
+            return false
+        }
+    }
+
     func revealScriptsFolder() {
         guard let support = packagingSupport else { return }
         NSWorkspace.shared.activateFileViewerSelecting([support.scriptsURL])
@@ -581,5 +615,90 @@ final class CodexProfilesViewModel: ObservableObject {
         }
 
         return nil
+    }
+
+    private func restartCodexApplication() async throws {
+        if let appURL = resolveCodexAppURL() {
+            let bundleID = Bundle(url: appURL)?.bundleIdentifier ?? "com.openai.codex"
+            let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            for app in runningApps {
+                _ = app.terminate()
+            }
+
+            if !runningApps.isEmpty {
+                try? await Task.sleep(for: .milliseconds(700))
+                for app in runningApps where !app.isTerminated {
+                    _ = app.forceTerminate()
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+            return
+        }
+
+        if let executable = resolveCodexExecutablePath() {
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = ["app"]
+            try process.run()
+            codexRelaunchPrompt = nil
+            return
+        }
+
+        throw CodexProfilesError.commandFailed("Install Codex.app or make the `codex` command available to reopen it automatically.")
+    }
+
+    private func resolveCodexAppURL() -> URL? {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") {
+            return url
+        }
+
+        let fileManager = FileManager.default
+        let candidates = [
+            URL(fileURLWithPath: "/Applications/Codex.app", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Codex.app", isDirectory: true),
+        ]
+
+        return candidates.first(where: { fileManager.fileExists(atPath: $0.path) })
+    }
+
+    private func resolveCodexExecutablePath() -> URL? {
+        let fileManager = FileManager.default
+        var candidates: [URL] = []
+
+        let pathEntries = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        candidates.append(contentsOf: pathEntries.map { URL(fileURLWithPath: $0).appendingPathComponent("codex") })
+
+        candidates.append(contentsOf: [
+            URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
+            URL(fileURLWithPath: "/usr/local/bin/codex"),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/codex"),
+        ])
+
+        let nvmVersionsRoot = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".nvm/versions/node", isDirectory: true)
+        if let versionDirs = try? fileManager.contentsOfDirectory(
+            at: nvmVersionsRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            candidates.append(contentsOf: versionDirs.map { $0.appendingPathComponent("bin/codex") })
+        }
+
+        return candidates.first(where: { fileManager.isExecutableFile(atPath: $0.path) })
     }
 }

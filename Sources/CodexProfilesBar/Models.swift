@@ -3,6 +3,7 @@ import Foundation
 enum Preferences {
     static let showIDsKey = "CodexProfilesBar.showIDs"
     static let autoRefreshKey = "CodexProfilesBar.autoRefresh"
+    static let promptReopenCodexKey = "CodexProfilesBar.promptReopenCodex"
 }
 
 enum ProfileFilter: String, CaseIterable, Identifiable {
@@ -416,6 +417,11 @@ struct BannerMessage: Identifiable, Equatable {
     let tone: Tone
     let title: String
     let body: String
+}
+
+struct CodexRelaunchPrompt: Identifiable, Equatable {
+    let id = UUID()
+    let profileName: String
 }
 
 enum SwitchMode {
