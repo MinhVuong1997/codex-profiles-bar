@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  Save the current session, switch accounts, inspect usage, run health checks, import or export bundles, and package everything as a clean macOS app.
+  Save the current session, switch accounts, inspect usage, run health checks, filter accounts, and package everything as a clean macOS app.
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="Assets/readme/demo-2026-04-18.png" alt="Codex Profiles Bar screenshot" width="560" />
+  <img src="Assets/readme/demo-2026-04-20.png" alt="Codex Profiles Bar screenshot" width="560" />
 </p>
 
 ## Overview
@@ -24,9 +24,11 @@ It keeps profile management in the menu bar so you can:
 
 - see all saved profiles and the current active session at a glance
 - switch between sessions without dropping back to the terminal
-- inspect usage from the status bar UI
+- inspect remaining usage, low-usage trends, and aggregate usage from the status bar UI
+- search, filter, favorite, and review saved profiles in a detached panel window
 - save the current session, rename labels, clear labels, delete profiles, and repair local storage
 - import and export portable JSON bundles
+- receive low-usage alerts and optionally auto-switch before a profile is exhausted
 
 No separate profile-management CLI is required.
 
@@ -37,8 +39,11 @@ No separate profile-management CLI is required.
 | Menu bar workflow | Fast access from the macOS status bar |
 | Built-in profile engine | Reads and writes profile data directly in `~/.codex` |
 | Active session detection | Keeps the current session pinned and easy to identify |
-| Usage inspection | Shows remaining usage and refreshes automatically |
+| Usage inspection | Shows remaining usage, sparkline history, aggregate stats, and refreshes automatically |
+| Search and filters | Filter profiles by usage or favorites and search by label, email, or plan |
 | Session management | Save, switch, label, clear, delete, import, and export |
+| Alerts and auto-switch | Notify on low usage or reset windows and auto-switch to the best fallback profile |
+| Detached panel and themes | Open a larger panel window with system, light, or dark appearance |
 | Doctor tools | Run storage checks and apply safe repairs |
 | Launch at login | Start automatically after login for packaged installs |
 | Packaging helpers | Build a standalone `.app` bundle and `.dmg` installer |

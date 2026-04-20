@@ -1,8 +1,10 @@
 import Foundation
 import AppKit
+import UserNotifications
+import ApplicationServices
 
 @MainActor
-final class CodexProfilesViewModel: ObservableObject {
+final class CodexProfilesViewModel: NSObject, ObservableObject {
     enum RefreshTrigger {
         case manual
         case automatic
@@ -27,33 +29,68 @@ final class CodexProfilesViewModel: ObservableObject {
     @Published private(set) var codexRelaunchPrompt: CodexRelaunchPrompt?
     @Published private(set) var isRestartingCodex = false
     @Published private(set) var lastRefresh: Date?
+    @Published private(set) var usageHistoryByProfileID: [String: [ProfileUsageHistoryPoint]] = [:]
+    @Published private(set) var aggregateUsage: AggregateUsageSummary?
+    @Published private(set) var detectedCodexVersion = DetectedCodexVersion(appVersion: nil, cliVersion: nil)
+    @Published private(set) var isCheckingForUpdates = false
+    @Published private(set) var isInstallingUpdate = false
+    @Published private(set) var availableAppUpdate: AppUpdateRelease?
     @Published var banner: BannerMessage?
 
     private let service = CodexProfilesService.shared
     private let launchAtLoginManager = LaunchAtLoginManager()
+    private let notificationCenter = UNUserNotificationCenter.current()
     private let autoRefreshInterval: Duration = .seconds(60)
+    private let fileManager = FileManager.default
+    private let updateDownloadSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 60 * 15
+        return URLSession(configuration: configuration)
+    }()
+    private let updateFeedURL = URL(string: "https://api.github.com/repos/MinhVuong1997/codex-profiles-bar/releases/latest")!
     private var bannerDismissTask: Task<Void, Never>?
     private var autoRefreshTask: Task<Void, Never>?
     private var switchReconcileTask: Task<Void, Never>?
+    private var favorites: [String]
+    private var orderedProfileIDs: [String]
+    private var lowUsageNotifications: [String: Bool] = [:]
+    private var resetSoonNotifications: [String: Bool] = [:]
+    private var usageHistoryURL: URL?
+    private var hasLoadedUsageHistory = false
+    private var isPerformingAutomaticSwitch = false
+    private var presentedUpdateVersion: String?
 
-    init() {
+    override init() {
         let storedAutoRefresh = UserDefaults.standard.object(forKey: Preferences.autoRefreshKey) as? Bool
         isAutoRefreshEnabled = storedAutoRefresh ?? true
+        favorites = UserDefaults.standard.stringArray(forKey: Preferences.favoriteProfileIDsKey) ?? []
+        orderedProfileIDs = UserDefaults.standard.stringArray(forKey: Preferences.orderedProfileIDsKey) ?? []
+        super.init()
         packagingSupport = Self.resolvePackagingSupport()
         refreshLaunchAtLoginState()
         configureAutoRefreshLoop()
         Task {
+            await requestNotificationAuthorizationIfNeeded()
+            await refreshDetectedCodexVersion()
+            await checkForUpdates(userInitiated: false)
             await refresh(trigger: .manual)
         }
+        installNotificationActionObserver()
     }
 
     deinit {
         switchReconcileTask?.cancel()
         autoRefreshTask?.cancel()
         bannerDismissTask?.cancel()
+        NotificationCenter.default.removeObserver(self)
     }
 
     var menuBarSymbolName: String {
+        let warningThreshold = notificationThreshold
+        if profiles.contains(where: { $0.isLowUsage(threshold: warningThreshold) }) {
+            return "person.crop.circle.badge.exclamationmark"
+        }
         if profiles.contains(where: { $0.isCurrent && !$0.isSaved }) {
             return "person.crop.circle.badge.exclamationmark"
         }
@@ -69,6 +106,23 @@ final class CodexProfilesViewModel: ObservableObject {
 
     var savedProfiles: [ProfileStatus] {
         profiles.filter(\.isSaved)
+    }
+
+    var menuBarTitle: String {
+        guard let current = profiles.first(where: \.isCurrent) else {
+            return "Codex"
+        }
+
+        let baseName = shortenedMenuBarTitle(for: current.primaryText)
+        if let percent = current.usageDisplayPercent {
+            return "\(baseName) \(percent)%"
+        }
+        return baseName
+    }
+
+    var notificationThreshold: Int {
+        let stored = UserDefaults.standard.integer(forKey: Preferences.usageWarningThresholdKey)
+        return stored == 0 ? 10 : stored
     }
 
     func refreshLaunchAtLoginState() {
@@ -106,6 +160,45 @@ final class CodexProfilesViewModel: ObservableObject {
         configureAutoRefreshLoop()
     }
 
+    func isFavorite(_ profile: ProfileStatus) -> Bool {
+        guard let id = profile.id else { return false }
+        return favorites.contains(id)
+    }
+
+    func toggleFavorite(_ profile: ProfileStatus) {
+        guard let id = profile.id else { return }
+        if let index = favorites.firstIndex(of: id) {
+            favorites.remove(at: index)
+        } else {
+            favorites.insert(id, at: 0)
+            if !orderedProfileIDs.contains(id) {
+                orderedProfileIDs.insert(id, at: 0)
+            }
+        }
+        persistOrdering()
+        profiles = sortProfiles(profiles)
+        aggregateUsage = makeAggregateUsageSummary(from: profiles)
+    }
+
+    @discardableResult
+    func cycleToNextProfile() async -> Bool {
+        let switchableProfiles = savedProfiles.filter { $0.id != nil }
+        guard !switchableProfiles.isEmpty else { return false }
+
+        let currentIndex = switchableProfiles.firstIndex(where: \.isCurrent) ?? -1
+        let nextIndex = (currentIndex + 1) % switchableProfiles.count
+        let nextProfile = switchableProfiles[nextIndex]
+
+        guard !nextProfile.isCurrent else { return false }
+        return await switchToProfile(
+            nextProfile,
+            mode: .standard,
+            shouldPromptReopen: false,
+            successTitle: "Cycled profile",
+            successBody: "Now using \(nextProfile.primaryText)."
+        )
+    }
+
     func refresh(trigger: RefreshTrigger = .manual) async {
         if isRefreshingProfiles {
             return
@@ -139,6 +232,19 @@ final class CodexProfilesViewModel: ObservableObject {
                 refreshLaunchAtLoginState()
             }
 
+            normalizeStoredOrdering()
+            profiles = sortProfiles(profiles)
+
+            if let storage = detectedStorage {
+                loadUsageHistoryIfNeeded(storage: storage)
+            }
+            persistUsageSnapshotsIfNeeded()
+            aggregateUsage = makeAggregateUsageSummary(from: profiles)
+            await evaluateUsageAlerts(trigger: trigger)
+            if trigger == .automatic {
+                await autoSwitchIfNeeded()
+            }
+
             if banner?.tone == .error {
                 banner = nil
             }
@@ -170,7 +276,13 @@ final class CodexProfilesViewModel: ObservableObject {
     }
 
     @discardableResult
-    func switchToProfile(_ profile: ProfileStatus, mode: SwitchMode) async -> Bool {
+    func switchToProfile(
+        _ profile: ProfileStatus,
+        mode: SwitchMode,
+        shouldPromptReopen: Bool? = nil,
+        successTitle: String = "Profile switched",
+        successBody: String? = nil
+    ) async -> Bool {
         guard let id = profile.id else { return false }
         switchingProfileID = id
         isLoading = true
@@ -182,9 +294,13 @@ final class CodexProfilesViewModel: ObservableObject {
         do {
             try await service.loadProfile(id: id, mode: mode)
             applyOptimisticSwitch(to: profile)
-            showBanner(title: "Profile switched", body: "Now using \(profile.primaryText).", tone: .success)
-            let shouldPromptReopen = UserDefaults.standard.object(forKey: Preferences.promptReopenCodexKey) as? Bool ?? true
-            if shouldPromptReopen {
+            showBanner(
+                title: successTitle,
+                body: successBody ?? "Now using \(profile.primaryText).",
+                tone: .success
+            )
+            let reopenPromptPreference = UserDefaults.standard.object(forKey: Preferences.promptReopenCodexKey) as? Bool ?? true
+            if shouldPromptReopen ?? reopenPromptPreference {
                 codexRelaunchPrompt = CodexRelaunchPrompt(profileName: profile.primaryText)
             }
             queueSwitchReconcile(for: profile, mode: mode)
@@ -301,7 +417,8 @@ final class CodexProfilesViewModel: ObservableObject {
         defer { isDoctorLoading = false }
 
         do {
-            doctorReport = try await service.doctor(fix: fix)
+            let report = try await service.doctor(fix: fix)
+            doctorReport = await enrichDoctorReport(report)
             if fix {
                 showBanner(title: "Doctor repair finished", body: "Storage checks were re-run with safe repairs enabled.", tone: .success)
                 await refresh(trigger: .mutation)
@@ -477,9 +594,22 @@ final class CodexProfilesViewModel: ObservableObject {
     }
 
     private func sortProfiles(_ profiles: [ProfileStatus]) -> [ProfileStatus] {
-        profiles.sorted { lhs, rhs in
+        let orderLookup = Dictionary(uniqueKeysWithValues: orderedProfileIDs.enumerated().map { ($0.element, $0.offset) })
+        return profiles.sorted { lhs, rhs in
             if lhs.isCurrent != rhs.isCurrent {
                 return lhs.isCurrent && !rhs.isCurrent
+            }
+
+            let lhsOrder = lhs.id.flatMap { orderLookup[$0] } ?? Int.max
+            let rhsOrder = rhs.id.flatMap { orderLookup[$0] } ?? Int.max
+            if lhsOrder != rhsOrder {
+                return lhsOrder < rhsOrder
+            }
+
+            let lhsFavorite = isFavorite(lhs)
+            let rhsFavorite = isFavorite(rhs)
+            if lhsFavorite != rhsFavorite {
+                return lhsFavorite && !rhsFavorite
             }
 
             let nameComparison = lhs.sortName.compare(
@@ -519,6 +649,435 @@ final class CodexProfilesViewModel: ObservableObject {
         )
     }
 
+    private func shortenedMenuBarTitle(for name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Codex" }
+        let compact = trimmed.replacingOccurrences(of: "@.*$", with: "", options: .regularExpression)
+        return String(compact.prefix(12))
+    }
+
+    private func persistOrdering() {
+        UserDefaults.standard.set(favorites, forKey: Preferences.favoriteProfileIDsKey)
+        UserDefaults.standard.set(orderedProfileIDs, forKey: Preferences.orderedProfileIDsKey)
+    }
+
+    private func normalizeStoredOrdering() {
+        let availableIDs = Set(savedProfiles.compactMap(\.id))
+        orderedProfileIDs = orderedProfileIDs.filter { availableIDs.contains($0) }
+        favorites = favorites.filter { availableIDs.contains($0) }
+
+        for id in savedProfiles.compactMap(\.id) where !orderedProfileIDs.contains(id) {
+            orderedProfileIDs.append(id)
+        }
+
+        persistOrdering()
+    }
+
+    private func requestNotificationAuthorizationIfNeeded() async {
+        let notificationsEnabled = UserDefaults.standard.object(forKey: Preferences.notificationsEnabledKey) as? Bool ?? true
+        guard notificationsEnabled else { return }
+        _ = try? await notificationCenter.requestAuthorization(options: [.alert, .sound, .badge])
+    }
+
+    private func installNotificationActionObserver() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleReopenCodexNotificationAction),
+            name: .reopenCodexFromNotification,
+            object: nil
+        )
+    }
+
+    @objc
+    private func handleReopenCodexNotificationAction() {
+        Task { @MainActor in
+            _ = await restartCodex()
+        }
+    }
+
+    private func refreshDetectedCodexVersion() async {
+        let appVersion = resolveCodexAppURL()
+            .flatMap { Bundle(url: $0) }
+            .flatMap { bundle in
+                bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+                    ?? bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+            }
+
+        let cliVersion = await detectCLIInstalledVersion()
+        detectedCodexVersion = DetectedCodexVersion(appVersion: appVersion, cliVersion: cliVersion)
+    }
+
+    private func detectCLIInstalledVersion() async -> String? {
+        guard let executable = resolveCodexExecutablePath() else { return nil }
+        return await Task.detached(priority: .utility) {
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = ["--version"]
+            let executableDirectory = executable.deletingLastPathComponent().path
+            let currentPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
+            process.environment = [
+                "PATH": "\(executableDirectory):\(currentPath):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            ]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(decoding: data, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard process.terminationStatus == 0, !output.isEmpty else { return nil }
+                let firstLine = output.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let firstLine, !firstLine.isEmpty else { return nil }
+                guard !firstLine.localizedCaseInsensitiveContains("no such file or directory"),
+                      !firstLine.hasPrefix("env:"),
+                      firstLine.localizedCaseInsensitiveContains("codex") else {
+                    return nil
+                }
+                return firstLine
+            } catch {
+                return nil
+            }
+        }.value
+    }
+
+    private func loadUsageHistoryIfNeeded(storage: StorageResolution) {
+        guard !hasLoadedUsageHistory else { return }
+
+        let historyURL = storage.url.appendingPathComponent("profiles-bar-usage-history.json")
+        let legacyHistoryURL = storage.url.appendingPathComponent("profiles/usage-history.json")
+        usageHistoryURL = historyURL
+        defer { hasLoadedUsageHistory = true }
+
+        if fileManager.fileExists(atPath: historyURL.path),
+           let data = try? Data(contentsOf: historyURL),
+           let store = decodeUsageHistoryStore(from: data) {
+            usageHistoryByProfileID = store.entries
+            return
+        }
+
+        if fileManager.fileExists(atPath: legacyHistoryURL.path),
+           let data = try? Data(contentsOf: legacyHistoryURL),
+           let store = decodeUsageHistoryStore(from: data) {
+            usageHistoryByProfileID = store.entries
+            writeUsageHistory()
+            return
+        }
+
+        guard fileManager.fileExists(atPath: historyURL.path),
+              let data = try? Data(contentsOf: historyURL),
+              let store = decodeUsageHistoryStore(from: data) else {
+            usageHistoryByProfileID = [:]
+            return
+        }
+        usageHistoryByProfileID = store.entries
+    }
+
+    private func decodeUsageHistoryStore(from data: Data) -> ProfileUsageHistoryStore? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+
+        if let store = try? decoder.decode(ProfileUsageHistoryStore.self, from: data) {
+            return store
+        }
+
+        guard let legacyEntries = try? decoder.decode([LegacyProfileUsageEntry].self, from: data) else {
+            return nil
+        }
+
+        var grouped = [String: [ProfileUsageHistoryPoint]]()
+        for entry in legacyEntries {
+            let point = ProfileUsageHistoryPoint(
+                recordedAt: Date(timeIntervalSince1970: TimeInterval(entry.timestamp)),
+                fiveHourPercent: entry.primaryBucket?.fiveHourLeftPercent,
+                weeklyPercent: entry.primaryBucket?.weeklyLeftPercent
+            )
+            grouped[entry.profileID, default: []].append(point)
+        }
+
+        for key in grouped.keys {
+            grouped[key] = grouped[key]?
+                .sorted(by: { $0.recordedAt < $1.recordedAt })
+                .reduce(into: [ProfileUsageHistoryPoint]()) { result, point in
+                    if result.last?.hourStamp != point.hourStamp {
+                        result.append(point)
+                    } else {
+                        result[result.count - 1] = point
+                    }
+                }
+        }
+
+        return ProfileUsageHistoryStore(entries: grouped)
+    }
+
+    private func persistUsageSnapshotsIfNeeded() {
+        guard usageHistoryURL != nil || detectedStorage != nil else { return }
+        if usageHistoryURL == nil, let detectedStorage {
+            usageHistoryURL = detectedStorage.url.appendingPathComponent("profiles-bar-usage-history.json")
+        }
+
+        var didChange = false
+        let now = Date()
+
+        for profile in profiles {
+            guard let id = profile.id, let bucket = profile.primaryUsageBucket else { continue }
+
+            let point = ProfileUsageHistoryPoint(
+                recordedAt: now,
+                fiveHourPercent: bucket.fiveHour?.leftPercent,
+                weeklyPercent: bucket.weekly?.leftPercent
+            )
+            var entries = usageHistoryByProfileID[id] ?? []
+            if let last = entries.last, last.hourStamp == point.hourStamp {
+                continue
+            }
+            entries.append(point)
+            entries = Array(entries.suffix(72))
+            usageHistoryByProfileID[id] = entries
+            didChange = true
+        }
+
+        if didChange {
+            writeUsageHistory()
+        }
+    }
+
+    private func writeUsageHistory() {
+        guard let usageHistoryURL else { return }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .secondsSince1970
+
+        do {
+            let data = try encoder.encode(ProfileUsageHistoryStore(entries: usageHistoryByProfileID))
+            if !fileManager.fileExists(atPath: usageHistoryURL.deletingLastPathComponent().path) {
+                try fileManager.createDirectory(
+                    at: usageHistoryURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true,
+                    attributes: nil
+                )
+            }
+            try data.write(to: usageHistoryURL, options: .atomic)
+        } catch {
+            // Keep history best-effort so background refresh never fails because of disk writes.
+        }
+    }
+
+    private struct LegacyProfileUsageEntry: Decodable {
+        let timestamp: Int
+        let profileID: String
+        let buckets: [LegacyProfileUsageBucket]
+
+        var primaryBucket: LegacyProfileUsageBucket? {
+            buckets.first
+        }
+    }
+
+    private struct LegacyProfileUsageBucket: Decodable {
+        let fiveHourLeftPercent: Int?
+        let weeklyLeftPercent: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case fiveHourLeftPercent
+            case weeklyLeftPercent
+        }
+    }
+
+    private func makeAggregateUsageSummary(from profiles: [ProfileStatus]) -> AggregateUsageSummary {
+        let buckets = profiles.compactMap(\.primaryUsageBucket)
+        return AggregateUsageSummary(
+            trackedProfilesCount: buckets.count,
+            favoritesCount: savedProfiles.filter { isFavorite($0) }.count,
+            totalFiveHourPercent: buckets.compactMap { $0.fiveHour?.leftPercent }.reduce(0, +),
+            totalWeeklyPercent: buckets.compactMap { $0.weekly?.leftPercent }.reduce(0, +),
+            lowProfilesCount: profiles.filter { $0.isLowUsage(threshold: notificationThreshold) }.count
+        )
+    }
+
+    private func evaluateUsageAlerts(trigger: RefreshTrigger) async {
+        let notificationsEnabled = UserDefaults.standard.object(forKey: Preferences.notificationsEnabledKey) as? Bool ?? true
+        guard notificationsEnabled else { return }
+        guard let currentProfile = profiles.first(where: \.isCurrent),
+              let id = currentProfile.id,
+              let bucket = currentProfile.primaryUsageBucket else {
+            lowUsageNotifications.removeAll()
+            resetSoonNotifications.removeAll()
+            return
+        }
+
+        lowUsageNotifications = lowUsageNotifications.filter { $0.key == id }
+        resetSoonNotifications = resetSoonNotifications.filter { $0.key == id }
+
+        let isLow = currentProfile.isLowUsage(threshold: notificationThreshold)
+        let wasLow = lowUsageNotifications[id] ?? false
+        if isLow && !wasLow {
+            await scheduleNotification(
+                identifier: "low-usage-\(id)",
+                title: "Codex profile running low",
+                body: "\(currentProfile.primaryText) is at \(currentProfile.usageDisplayPercent ?? 0)% remaining."
+            )
+        }
+        lowUsageNotifications[id] = isLow
+
+        let resetSoon = bucket.nearestResetAt.map {
+            Date(timeIntervalSince1970: TimeInterval($0)).timeIntervalSinceNow <= 6 * 3600
+        } ?? false
+        let wasResetSoon = resetSoonNotifications[id] ?? false
+        if resetSoon && !wasResetSoon && trigger != .mutation {
+            await scheduleNotification(
+                identifier: "reset-soon-\(id)",
+                title: "Codex usage resets soon",
+                body: "\(currentProfile.primaryText) has a usage bucket resetting within the next 6 hours."
+            )
+        }
+        resetSoonNotifications[id] = resetSoon
+    }
+
+    private func autoSwitchIfNeeded() async {
+        let autoSwitchEnabled = UserDefaults.standard.object(forKey: Preferences.autoSwitchOnDepletionKey) as? Bool ?? false
+        guard autoSwitchEnabled, !isPerformingAutomaticSwitch else { return }
+        guard let current = profiles.first(where: \.isCurrent), current.isUsageDepleted else { return }
+
+        guard let fallback = savedProfiles
+            .filter({ !$0.isCurrent && ($0.usageDisplayPercent ?? 0) > 0 })
+            .max(by: { ($0.usageDisplayPercent ?? 0) < ($1.usageDisplayPercent ?? 0) }) else {
+            return
+        }
+
+        isPerformingAutomaticSwitch = true
+        defer { isPerformingAutomaticSwitch = false }
+
+        let switched = await switchToProfile(
+            fallback,
+            mode: .standard,
+            shouldPromptReopen: false,
+            successTitle: "Auto-switched profile",
+            successBody: "Switched to \(fallback.primaryText) because the current profile ran out of usage."
+        )
+
+        if switched {
+            await scheduleNotification(
+                identifier: "auto-switch-\(fallback.stableID)",
+                title: "Codex profile auto-switched",
+                body: "Now using \(fallback.primaryText) because the previous profile was depleted.",
+                categoryIdentifier: NotificationCategoryIdentifier.autoSwitch
+            )
+        }
+    }
+
+    private func scheduleNotification(
+        identifier: String,
+        title: String,
+        body: String,
+        categoryIdentifier: String? = nil
+    ) async {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        if let categoryIdentifier {
+            content.categoryIdentifier = categoryIdentifier
+        }
+
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        )
+
+        try? await notificationCenter.add(request)
+    }
+
+    private func enrichDoctorReport(_ report: DoctorReport) async -> DoctorReport {
+        var checks = report.checks
+
+        if let detectedStorage {
+            let authURL = detectedStorage.url.appendingPathComponent("auth.json")
+            let profilesURL = detectedStorage.url.appendingPathComponent("profiles", isDirectory: true)
+            checks.append(doctorCheckForLoginStatus(authURL: authURL))
+            checks.append(doctorCheckForPermissions(name: "auth permissions", url: authURL))
+            checks.append(doctorCheckForPermissions(name: "profiles permissions", url: profilesURL))
+        }
+
+        checks.append(
+            DoctorCheck(
+                name: "global shortcut accessibility",
+                level: AXIsProcessTrusted() ? "ok" : "warn",
+                detail: AXIsProcessTrusted()
+                    ? "trusted for global key monitoring"
+                    : "grant Accessibility access for Option-Command-P outside the app"
+            )
+        )
+
+        checks.append(await doctorCheckForAuthNetwork())
+        let summary = summarizeDoctorChecks(checks)
+        return DoctorReport(checks: checks, summary: summary, repairs: report.repairs, error: report.error)
+    }
+
+    private func summarizeDoctorChecks(_ checks: [DoctorCheck]) -> DoctorSummary {
+        var ok = 0
+        var warn = 0
+        var error = 0
+        var info = 0
+
+        for check in checks {
+            switch check.level {
+            case "ok": ok += 1
+            case "warn": warn += 1
+            case "error": error += 1
+            default: info += 1
+            }
+        }
+
+        return DoctorSummary(ok: ok, warn: warn, error: error, info: info)
+    }
+
+    private func doctorCheckForLoginStatus(authURL: URL) -> DoctorCheck {
+        guard fileManager.fileExists(atPath: authURL.path) else {
+            return DoctorCheck(name: "login status", level: "warn", detail: "auth.json missing")
+        }
+
+        guard let data = try? Data(contentsOf: authURL), !data.isEmpty else {
+            return DoctorCheck(name: "login status", level: "warn", detail: "auth.json is empty")
+        }
+
+        return DoctorCheck(name: "login status", level: "ok", detail: "credentials file present")
+    }
+
+    private func doctorCheckForPermissions(name: String, url: URL) -> DoctorCheck {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              let permissions = attributes[.posixPermissions] as? NSNumber else {
+            return DoctorCheck(name: name, level: "warn", detail: "could not read permissions")
+        }
+
+        let octal = String(permissions.intValue, radix: 8)
+        return DoctorCheck(name: name, level: "info", detail: "mode \(octal)")
+    }
+
+    private func doctorCheckForAuthNetwork() async -> DoctorCheck {
+        guard let url = URL(string: "https://auth.openai.com") else {
+            return DoctorCheck(name: "auth network", level: "error", detail: "invalid auth URL")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 5
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if (200..<500).contains(statusCode) {
+                return DoctorCheck(name: "auth network", level: "ok", detail: "reachable (\(statusCode))")
+            }
+            return DoctorCheck(name: "auth network", level: "warn", detail: "unexpected status \(statusCode)")
+        } catch {
+            return DoctorCheck(name: "auth network", level: "warn", detail: error.localizedDescription)
+        }
+    }
+
     private func showBanner(title: String, body: String, tone: BannerMessage.Tone) {
         bannerDismissTask?.cancel()
         let message = BannerMessage(tone: tone, title: title, body: body)
@@ -546,6 +1105,56 @@ final class CodexProfilesViewModel: ObservableObject {
 
     func dismissCodexRelaunchPrompt() {
         codexRelaunchPrompt = nil
+    }
+
+    func checkForUpdates(userInitiated: Bool = true) async {
+        guard !isCheckingForUpdates else { return }
+        guard let currentVersion = currentProfilesBarVersion() else {
+            if userInitiated {
+                showBanner(
+                    title: "Version unavailable",
+                    body: "Update checks require a packaged app build with a bundle version.",
+                    tone: .warning
+                )
+            }
+            return
+        }
+
+        isCheckingForUpdates = true
+        defer { isCheckingForUpdates = false }
+
+        do {
+            let release = try await fetchLatestAppRelease()
+            guard isVersion(release.version, newerThan: currentVersion) else {
+                if userInitiated {
+                    showBanner(
+                        title: "Up to date",
+                        body: "Codex Profiles Bar \(currentVersion) is the latest available release.",
+                        tone: .success
+                    )
+                }
+                return
+            }
+
+            availableAppUpdate = release
+
+            if !userInitiated, presentedUpdateVersion == release.version {
+                return
+            }
+
+            presentedUpdateVersion = release.version
+            presentUpdateAlert(for: release, currentVersion: currentVersion)
+        } catch {
+            if userInitiated {
+                showBanner(title: "Update check failed", body: error.localizedDescription, tone: .error)
+            }
+        }
+    }
+
+    func showAvailableUpdateDetails() {
+        guard let release = availableAppUpdate else { return }
+        let currentVersion = currentProfilesBarVersion() ?? "current build"
+        presentUpdateAlert(for: release, currentVersion: currentVersion)
     }
 
     @discardableResult
@@ -651,7 +1260,7 @@ final class CodexProfilesViewModel: ObservableObject {
         if let executable = resolveCodexExecutablePath() {
             let process = Process()
             process.executableURL = executable
-            process.arguments = ["app"]
+            process.arguments = ["app", currentWorkspaceURL().path]
             try process.run()
             codexRelaunchPrompt = nil
             return
@@ -700,5 +1309,336 @@ final class CodexProfilesViewModel: ObservableObject {
         }
 
         return candidates.first(where: { fileManager.isExecutableFile(atPath: $0.path) })
+    }
+
+    private func currentWorkspaceURL() -> URL {
+        packagingSupport?.rootURL ?? Self.packageRootURL ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    }
+
+    private func currentProfilesBarVersion() -> String? {
+        let bundle = Bundle.main
+        let shortVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let trimmedShortVersion = shortVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedShortVersion, !trimmedShortVersion.isEmpty {
+            return normalizeVersionString(trimmedShortVersion)
+        }
+        return nil
+    }
+
+    private func fetchLatestAppRelease() async throws -> AppUpdateRelease {
+        var request = URLRequest(url: updateFeedURL)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("CodexProfilesBar", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 10
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CodexProfilesError.invalidResponse("Update server returned an invalid response.")
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw CodexProfilesError.invalidResponse("Update server returned status \(httpResponse.statusCode).")
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let release = try decoder.decode(GitHubReleaseResponse.self, from: data)
+        let normalizedVersion = normalizeVersionString(release.tagName)
+        guard !normalizedVersion.isEmpty else {
+            throw CodexProfilesError.invalidResponse("Latest release is missing a valid version tag.")
+        }
+
+        let primaryAssetURL = release.assets.first(where: { $0.name.localizedCaseInsensitiveContains(".dmg") })?.browserDownloadURL
+            ?? release.assets.first?.browserDownloadURL
+
+        return AppUpdateRelease(
+            version: normalizedVersion,
+            title: release.name?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? release.tagName,
+            notes: release.body?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "No release notes were provided for this release.",
+            htmlURL: release.htmlURL,
+            downloadURL: primaryAssetURL,
+            publishedAt: release.publishedAt
+        )
+    }
+
+    private func normalizeVersionString(_ value: String) -> String {
+        let cleaned = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "^[^0-9]+", with: "", options: .regularExpression)
+        return cleaned.isEmpty ? value.trimmingCharacters(in: .whitespacesAndNewlines) : cleaned
+    }
+
+    private func isVersion(_ lhs: String, newerThan rhs: String) -> Bool {
+        let lhsComponents = versionComponents(from: lhs)
+        let rhsComponents = versionComponents(from: rhs)
+        let count = max(lhsComponents.count, rhsComponents.count)
+
+        for index in 0..<count {
+            let lhsValue = index < lhsComponents.count ? lhsComponents[index] : 0
+            let rhsValue = index < rhsComponents.count ? rhsComponents[index] : 0
+            if lhsValue != rhsValue {
+                return lhsValue > rhsValue
+            }
+        }
+        return false
+    }
+
+    private func versionComponents(from value: String) -> [Int] {
+        normalizeVersionString(value)
+            .split(separator: ".")
+            .compactMap { component in
+                let digits = component.replacingOccurrences(of: "[^0-9]", with: "", options: .regularExpression)
+                return Int(digits)
+            }
+    }
+
+    private func presentUpdateAlert(for release: AppUpdateRelease, currentVersion: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Update available: \(release.title)"
+        alert.informativeText = "Installed version: \(currentVersion)\nLatest version: \(release.version)"
+        alert.addButton(withTitle: "Install Update")
+        alert.addButton(withTitle: "Open Release Page")
+        alert.addButton(withTitle: "Later")
+        alert.accessoryView = makeUpdateNotesView(for: release)
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            Task { await installUpdate(for: release) }
+        } else if response == .alertSecondButtonReturn {
+            NSWorkspace.shared.open(release.htmlURL)
+        }
+    }
+
+    private func makeUpdateNotesView(for release: AppUpdateRelease) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.spacing = 10
+        container.alignment = .leading
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSTextField(labelWithString: "Release notes")
+        header.font = .systemFont(ofSize: 12, weight: .semibold)
+        header.textColor = .secondaryLabelColor
+
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = .systemFont(ofSize: 12)
+        textView.string = release.notes
+        textView.textColor = .labelColor
+        textView.textContainerInset = NSSize(width: 0, height: 4)
+
+        let scrollView = NSScrollView()
+        scrollView.borderType = .bezelBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = false
+        scrollView.documentView = textView
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.frame = NSRect(x: 0, y: 0, width: 420, height: 220)
+
+        container.addArrangedSubview(header)
+        container.addArrangedSubview(scrollView)
+        return container
+    }
+
+    private func installUpdate(for release: AppUpdateRelease) async {
+        guard !isInstallingUpdate else { return }
+        isInstallingUpdate = true
+
+        do {
+            let installation = try await prepareSelfUpdateInstallation(for: release)
+            try launchSelfUpdateInstaller(installation.scriptURL)
+            showBanner(
+                title: "Installing update",
+                body: "Codex Profiles Bar will relaunch after version \(release.version) is installed.",
+                tone: .success
+            )
+            try? await Task.sleep(for: .milliseconds(350))
+            NSApp.terminate(nil)
+        } catch {
+            isInstallingUpdate = false
+            showBanner(title: "Install update failed", body: error.localizedDescription, tone: .error)
+        }
+    }
+
+    private func prepareSelfUpdateInstallation(for release: AppUpdateRelease) async throws -> SelfUpdateInstallation {
+        guard let downloadURL = release.downloadURL else {
+            throw CodexProfilesError.commandFailed("This release does not include a direct install asset. Open the release page instead.")
+        }
+
+        let targetAppURL = try currentAppBundleURLForSelfUpdate()
+        let workDirectory = try makeSelfUpdateWorkspace(for: release.version)
+        let diskImageURL = workDirectory.appendingPathComponent(downloadURL.lastPathComponent.nonEmpty ?? "CodexProfilesBar-\(release.version).dmg")
+        let logURL = workDirectory.appendingPathComponent("self-update.log")
+
+        try await downloadUpdateDiskImage(from: downloadURL, to: diskImageURL)
+
+        let scriptURL = try writeSelfUpdateScript(
+            releaseVersion: release.version,
+            workDirectory: workDirectory,
+            diskImageURL: diskImageURL,
+            targetAppURL: targetAppURL,
+            logURL: logURL
+        )
+
+        return SelfUpdateInstallation(scriptURL: scriptURL)
+    }
+
+    private func currentAppBundleURLForSelfUpdate() throws -> URL {
+        let bundleURL = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
+        guard bundleURL.pathExtension == "app" else {
+            throw CodexProfilesError.commandFailed("Self-update only works from a packaged .app build.")
+        }
+
+        let parentDirectory = bundleURL.deletingLastPathComponent()
+        guard fileManager.isWritableFile(atPath: parentDirectory.path) || fileManager.isWritableFile(atPath: bundleURL.path) else {
+            throw CodexProfilesError.commandFailed("The current app location is not writable. Move Codex Profiles Bar to a writable folder such as ~/Applications or update it manually.")
+        }
+
+        return bundleURL
+    }
+
+    private func makeSelfUpdateWorkspace(for version: String) throws -> URL {
+        let sanitizedVersion = version
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "-", options: .regularExpression)
+        let workDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("codexprofilesbar-update-\(sanitizedVersion)-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: workDirectory, withIntermediateDirectories: true)
+        return workDirectory
+    }
+
+    private func downloadUpdateDiskImage(from remoteURL: URL, to localURL: URL) async throws {
+        var request = URLRequest(url: remoteURL)
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        request.setValue("CodexProfilesBar", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 60
+
+        let (temporaryURL, response) = try await updateDownloadSession.download(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CodexProfilesError.invalidResponse("Update download returned an invalid response.")
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw CodexProfilesError.invalidResponse("Update download returned status \(httpResponse.statusCode).")
+        }
+
+        if fileManager.fileExists(atPath: localURL.path) {
+            try fileManager.removeItem(at: localURL)
+        }
+        try fileManager.moveItem(at: temporaryURL, to: localURL)
+    }
+
+    private func writeSelfUpdateScript(
+        releaseVersion: String,
+        workDirectory: URL,
+        diskImageURL: URL,
+        targetAppURL: URL,
+        logURL: URL
+    ) throws -> URL {
+        let scriptURL = workDirectory.appendingPathComponent("install-update.sh")
+        let script = """
+        #!/bin/zsh
+        set -euo pipefail
+
+        APP_PID=\(ProcessInfo.processInfo.processIdentifier)
+        RELEASE_VERSION=\(shellQuoted(releaseVersion))
+        WORK_DIR=\(shellQuoted(workDirectory.path))
+        DISK_IMAGE=\(shellQuoted(diskImageURL.path))
+        TARGET_APP=\(shellQuoted(targetAppURL.path))
+        LOG_FILE=\(shellQuoted(logURL.path))
+        MOUNT_POINT="$WORK_DIR/mount"
+        STAGED_APP="$WORK_DIR/staged-app"
+
+        exec >>"$LOG_FILE" 2>&1
+
+        cleanup() {
+          /usr/bin/hdiutil detach "$MOUNT_POINT" -quiet >/dev/null 2>&1 || /usr/bin/hdiutil detach "$MOUNT_POINT" -force -quiet >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+
+        echo "Installing Codex Profiles Bar $RELEASE_VERSION"
+
+        while /bin/kill -0 "$APP_PID" >/dev/null 2>&1; do
+          /bin/sleep 0.5
+        done
+
+        /bin/mkdir -p "$MOUNT_POINT"
+        /usr/bin/hdiutil attach "$DISK_IMAGE" -nobrowse -quiet -mountpoint "$MOUNT_POINT"
+
+        SOURCE_APP=$(/usr/bin/find "$MOUNT_POINT" -maxdepth 2 -name '*.app' -print -quit)
+        if [ -z "$SOURCE_APP" ]; then
+          echo "No .app bundle found inside downloaded update image."
+          exit 1
+        fi
+
+        /bin/rm -rf "$STAGED_APP"
+        /usr/bin/ditto "$SOURCE_APP" "$STAGED_APP"
+        /bin/rm -rf "$TARGET_APP"
+        /usr/bin/ditto "$STAGED_APP" "$TARGET_APP"
+        /usr/bin/xattr -cr "$TARGET_APP" || true
+        /usr/bin/open "$TARGET_APP"
+
+        ( /bin/sleep 4; /bin/rm -rf "$WORK_DIR" ) >/dev/null 2>&1 &
+        """
+
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
+    private func launchSelfUpdateInstaller(_ scriptURL: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [scriptURL.path]
+        process.currentDirectoryURL = scriptURL.deletingLastPathComponent()
+        process.standardInput = nil
+        process.standardOutput = nil
+        process.standardError = nil
+        try process.run()
+    }
+
+    private func shellQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
+    }
+
+    private struct SelfUpdateInstallation {
+        let scriptURL: URL
+    }
+
+    private struct GitHubReleaseResponse: Decodable {
+        let tagName: String
+        let name: String?
+        let body: String?
+        let htmlURL: URL
+        let publishedAt: Date?
+        let assets: [GitHubReleaseAsset]
+
+        enum CodingKeys: String, CodingKey {
+            case tagName = "tag_name"
+            case name
+            case body
+            case htmlURL = "html_url"
+            case publishedAt = "published_at"
+            case assets
+        }
+    }
+
+    private struct GitHubReleaseAsset: Decodable {
+        let name: String
+        let browserDownloadURL: URL
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case browserDownloadURL = "browser_download_url"
+        }
+    }
+}
+
+private extension String {
+    var nonEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

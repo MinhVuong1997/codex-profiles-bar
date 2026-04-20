@@ -722,7 +722,13 @@ private extension CodexProfilesNativeEngine {
 
     func isProfileFile(_ url: URL) -> Bool {
         guard url.pathExtension == "json" else { return false }
-        return !["profiles.json", "update.json"].contains(url.lastPathComponent)
+        let reservedFilenames: Set<String> = [
+            "profiles.json",
+            "update.json",
+            "usage-history.json",
+            "profiles-bar-usage-history.json"
+        ]
+        return !reservedFilenames.contains(url.lastPathComponent) && !url.lastPathComponent.hasPrefix(".")
     }
 
     func profileID(from url: URL) -> String? {

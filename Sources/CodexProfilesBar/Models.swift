@@ -4,11 +4,23 @@ enum Preferences {
     static let showIDsKey = "CodexProfilesBar.showIDs"
     static let autoRefreshKey = "CodexProfilesBar.autoRefresh"
     static let promptReopenCodexKey = "CodexProfilesBar.promptReopenCodex"
+    static let panelThemeKey = "CodexProfilesBar.panelTheme"
+    static let compactModeKey = "CodexProfilesBar.compactMode"
+    static let groupingKey = "CodexProfilesBar.grouping"
+    static let favoriteProfileIDsKey = "CodexProfilesBar.favoriteProfileIDs"
+    static let orderedProfileIDsKey = "CodexProfilesBar.orderedProfileIDs"
+    static let notificationsEnabledKey = "CodexProfilesBar.notificationsEnabled"
+    static let usageWarningThresholdKey = "CodexProfilesBar.usageWarningThreshold"
+    static let autoSwitchOnDepletionKey = "CodexProfilesBar.autoSwitchOnDepletion"
+    static let accentRedKey = "CodexProfilesBar.accentRed"
+    static let accentGreenKey = "CodexProfilesBar.accentGreen"
+    static let accentBlueKey = "CodexProfilesBar.accentBlue"
 }
 
 enum ProfileFilter: String, CaseIterable, Identifiable {
     case all
     case hasUsage
+    case favorites
 
     var id: String { rawValue }
 
@@ -18,6 +30,24 @@ enum ProfileFilter: String, CaseIterable, Identifiable {
             "All"
         case .hasUsage:
             "Has Usage"
+        case .favorites:
+            "Favorites"
+        }
+    }
+}
+
+enum ProfileGrouping: String, CaseIterable, Identifiable {
+    case none
+    case plan
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .none:
+            "Flat"
+        case .plan:
+            "Plan"
         }
     }
 }
@@ -174,7 +204,7 @@ struct ProfileStatus: Decodable, Hashable, Identifiable {
     }
 
     var canSwitch: Bool {
-        isSaved && !isCurrent && id != nil
+        isSaved && !isCurrent && id != nil && error == nil
     }
 
     var primaryUsageBucket: UsageBucket? {
@@ -439,6 +469,17 @@ struct PackagingSupport {
     let rootURL: URL
     let scriptsURL: URL
     let distURL: URL
+}
+
+struct AppUpdateRelease: Identifiable, Equatable {
+    let version: String
+    let title: String
+    let notes: String
+    let htmlURL: URL
+    let downloadURL: URL?
+    let publishedAt: Date?
+
+    var id: String { version }
 }
 
 enum CodexProfilesError: LocalizedError {
