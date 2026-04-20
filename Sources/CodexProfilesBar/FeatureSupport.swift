@@ -31,6 +31,28 @@ enum PanelTheme: String, CaseIterable, Identifiable {
         }
     }
 
+    var appearance: NSAppearance? {
+        switch self {
+        case .system:
+            nil
+        case .light:
+            NSAppearance(named: .aqua)
+        case .dark:
+            NSAppearance(named: .darkAqua)
+        }
+    }
+
+    func resolvedAppearance(using systemColorScheme: ColorScheme) -> NSAppearance? {
+        switch resolvedColorScheme(using: systemColorScheme) {
+        case .light:
+            NSAppearance(named: .aqua)
+        case .dark:
+            NSAppearance(named: .darkAqua)
+        @unknown default:
+            NSAppearance(named: .darkAqua)
+        }
+    }
+
     func resolvedColorScheme(using systemColorScheme: ColorScheme) -> ColorScheme {
         switch self {
         case .system:
@@ -40,6 +62,35 @@ enum PanelTheme: String, CaseIterable, Identifiable {
         case .dark:
             .dark
         }
+    }
+}
+
+final class SystemAppearanceObserver: NSObject, ObservableObject {
+    @Published private(set) var colorScheme: ColorScheme
+
+    override init() {
+        colorScheme = SystemAppearanceObserver.currentSystemColorScheme()
+        super.init()
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleSystemAppearanceChanged),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil
+        )
+    }
+
+    deinit {
+        DistributedNotificationCenter.default().removeObserver(self)
+    }
+
+    @objc
+    private func handleSystemAppearanceChanged() {
+        colorScheme = SystemAppearanceObserver.currentSystemColorScheme()
+    }
+
+    static func currentSystemColorScheme() -> ColorScheme {
+        let interfaceStyle = UserDefaults.standard.string(forKey: "AppleInterfaceStyle")?.lowercased()
+        return interfaceStyle == "dark" ? .dark : .light
     }
 }
 
@@ -232,6 +283,15 @@ extension ProfileStatus {
 
     var usageDisplayPercent: Int? {
         primaryUsageBucket?.effectiveRemainingPercent
+    }
+
+    var hasUsageData: Bool {
+        usage?.state == "ok" && primaryUsageBucket != nil
+    }
+
+    var resetsSoon: Bool {
+        guard let resetAt = primaryUsageBucket?.nearestResetAt else { return false }
+        return Date(timeIntervalSince1970: TimeInterval(resetAt)).timeIntervalSinceNow <= 6 * 3600
     }
 
     var isUsageDepleted: Bool {

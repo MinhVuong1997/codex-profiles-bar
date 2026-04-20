@@ -72,16 +72,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 struct CodexProfilesBarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = CodexProfilesViewModel()
+    @StateObject private var systemAppearance = SystemAppearanceObserver()
     @AppStorage(Preferences.panelThemeKey) private var panelThemeRaw = PanelTheme.system.rawValue
 
     private var selectedTheme: PanelTheme {
         PanelTheme(rawValue: panelThemeRaw) ?? .system
     }
 
+    private var resolvedColorScheme: ColorScheme {
+        selectedTheme.resolvedColorScheme(using: systemAppearance.colorScheme)
+    }
+
+    private var resolvedAppearance: NSAppearance? {
+        selectedTheme.resolvedAppearance(using: systemAppearance.colorScheme)
+    }
+
     var body: some Scene {
         MenuBarExtra {
-            MenuBarRootView(model: model)
-                .preferredColorScheme(selectedTheme.preferredColorScheme)
+            MenuBarRootView(model: model, resolvedColorScheme: resolvedColorScheme)
+                .preferredColorScheme(resolvedColorScheme)
+                .background(WindowAppearanceConfigurator(appearance: resolvedAppearance))
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: model.menuBarSymbolName)
@@ -94,15 +104,16 @@ struct CodexProfilesBarApp: App {
         .keyboardShortcut(nil)
 
         Settings {
-            SettingsView(model: model)
-                .preferredColorScheme(selectedTheme.preferredColorScheme)
+            SettingsView(model: model, resolvedColorScheme: resolvedColorScheme)
+                .preferredColorScheme(resolvedColorScheme)
+                .background(WindowAppearanceConfigurator(appearance: resolvedAppearance))
                 .frame(width: 640, height: 460)
         }
 
         Window("Profiles Panel", id: "profiles-panel") {
-            MenuBarRootView(model: model, isDetached: true)
-                .preferredColorScheme(selectedTheme.preferredColorScheme)
-                .background(DetachedPanelWindowConfigurator())
+            MenuBarRootView(model: model, isDetached: true, resolvedColorScheme: resolvedColorScheme)
+                .preferredColorScheme(resolvedColorScheme)
+                .background(DetachedPanelWindowConfigurator(appearance: resolvedAppearance))
         }
         .windowResizability(.contentMinSize)
     }
@@ -128,7 +139,34 @@ enum NotificationActionIdentifier {
     static let reopenCodex = "REOPEN_CODEX"
 }
 
+private struct WindowAppearanceConfigurator: NSViewRepresentable {
+    let appearance: NSAppearance?
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            applyAppearance(to: view.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            applyAppearance(to: nsView.window)
+        }
+    }
+
+    private func applyAppearance(to window: NSWindow?) {
+        guard let window else { return }
+        window.appearance = appearance
+        window.invalidateShadow()
+        window.contentView?.needsDisplay = true
+    }
+}
+
 private struct DetachedPanelWindowConfigurator: NSViewRepresentable {
+    let appearance: NSAppearance?
+
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
@@ -157,6 +195,7 @@ private struct DetachedPanelWindowConfigurator: NSViewRepresentable {
         window.hidesOnDeactivate = false
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
+        window.appearance = appearance
         coordinator.attach(to: window)
     }
 

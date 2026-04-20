@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="Assets/readme/demo-2026-04-20.png" alt="Codex Profiles Bar screenshot" width="560" />
+  <img src="Assets/readme/demo-2026-04-21.png" alt="Codex Profiles Bar screenshot" width="560" />
 </p>
 
 ## Overview

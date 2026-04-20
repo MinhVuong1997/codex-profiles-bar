@@ -35,6 +35,8 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     @Published private(set) var isCheckingForUpdates = false
     @Published private(set) var isInstallingUpdate = false
     @Published private(set) var availableAppUpdate: AppUpdateRelease?
+    @Published private(set) var notificationInboxItems: [NotificationInboxItem] = []
+    @Published private(set) var recommendedSwitch: ProfileSwitchRecommendation?
     @Published var banner: BannerMessage?
 
     private let service = CodexProfilesService.shared
@@ -68,6 +70,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         orderedProfileIDs = UserDefaults.standard.stringArray(forKey: Preferences.orderedProfileIDsKey) ?? []
         super.init()
         packagingSupport = Self.resolvePackagingSupport()
+        loadNotificationInbox()
         refreshLaunchAtLoginState()
         configureAutoRefreshLoop()
         Task {
@@ -125,6 +128,14 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         return stored == 0 ? 10 : stored
     }
 
+    var currentProfile: ProfileStatus? {
+        profiles.first(where: \.isCurrent)
+    }
+
+    var unreadInboxCount: Int {
+        notificationInboxItems.filter(\.isUnread).count
+    }
+
     func refreshLaunchAtLoginState() {
         launchAtLoginState = launchAtLoginManager.currentState()
     }
@@ -175,6 +186,25 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 orderedProfileIDs.insert(id, at: 0)
             }
         }
+        persistOrdering()
+        profiles = sortProfiles(profiles)
+        aggregateUsage = makeAggregateUsageSummary(from: profiles)
+    }
+
+    func setFavoriteState(for profileIDs: Set<String>, isFavorite: Bool) {
+        guard !profileIDs.isEmpty else { return }
+
+        if isFavorite {
+            for id in profileIDs where !favorites.contains(id) {
+                favorites.insert(id, at: 0)
+                if !orderedProfileIDs.contains(id) {
+                    orderedProfileIDs.insert(id, at: 0)
+                }
+            }
+        } else {
+            favorites.removeAll { profileIDs.contains($0) }
+        }
+
         persistOrdering()
         profiles = sortProfiles(profiles)
         aggregateUsage = makeAggregateUsageSummary(from: profiles)
@@ -240,6 +270,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             }
             persistUsageSnapshotsIfNeeded()
             aggregateUsage = makeAggregateUsageSummary(from: profiles)
+            updateSmartSwitchRecommendation()
             await evaluateUsageAlerts(trigger: trigger)
             if trigger == .automatic {
                 await autoSwitchIfNeeded()
@@ -412,6 +443,95 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
     }
 
+    @discardableResult
+    func deleteProfiles(_ profilesToDelete: [ProfileStatus]) async -> Bool {
+        let targets = profilesToDelete.compactMap { profile -> (String, String)? in
+            guard let id = profile.id else { return nil }
+            return (id, profile.primaryText)
+        }
+        guard !targets.isEmpty else { return false }
+
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            for (id, _) in targets {
+                try await service.deleteProfile(id: id)
+            }
+            let descriptor = targets.count == 1 ? targets[0].1 : "\(targets.count) profiles"
+            showBanner(title: "Profiles deleted", body: "Removed \(descriptor) from saved profiles.", tone: .success)
+            await refresh(trigger: .mutation)
+            return true
+        } catch {
+            showBanner(title: "Command failed", body: error.localizedDescription, tone: .error)
+            return false
+        }
+    }
+
+    func markInboxItemRead(_ item: NotificationInboxItem) {
+        guard let index = notificationInboxItems.firstIndex(where: { $0.id == item.id }) else { return }
+        guard notificationInboxItems[index].isUnread else { return }
+        notificationInboxItems[index].isUnread = false
+        persistNotificationInbox()
+    }
+
+    func markAllInboxItemsRead() {
+        guard notificationInboxItems.contains(where: \.isUnread) else { return }
+        notificationInboxItems = notificationInboxItems.map { item in
+            var updated = item
+            updated.isUnread = false
+            return updated
+        }
+        persistNotificationInbox()
+    }
+
+    func clearNotificationInbox() {
+        notificationInboxItems = []
+        persistNotificationInbox()
+    }
+
+    @discardableResult
+    func performInboxAction(for item: NotificationInboxItem) async -> Bool {
+        markInboxItemRead(item)
+
+        guard let actionKind = item.actionKind else { return true }
+
+        switch actionKind {
+        case .reopenCodex:
+            return await restartCodex()
+        case .switchToProfile:
+            guard let targetID = item.targetProfileID,
+                  let profile = savedProfiles.first(where: { $0.id == targetID }) else {
+                showBanner(title: "Profile unavailable", body: "That saved profile is no longer available.", tone: .warning)
+                return false
+            }
+            return await switchToProfile(
+                profile,
+                mode: .standard,
+                shouldPromptReopen: false,
+                successTitle: "Recommended profile switched",
+                successBody: "Now using \(profile.primaryText)."
+            )
+        }
+    }
+
+    @discardableResult
+    func switchToRecommendedProfile() async -> Bool {
+        guard let recommendation = recommendedSwitch,
+              let profile = savedProfiles.first(where: { $0.id == recommendation.profileID }) else {
+            showBanner(title: "No recommendation", body: "There is no recommended fallback profile right now.", tone: .warning)
+            return false
+        }
+
+        return await switchToProfile(
+            profile,
+            mode: .standard,
+            shouldPromptReopen: true,
+            successTitle: "Switched to recommended profile",
+            successBody: "Now using \(profile.primaryText) with \(recommendation.usagePercent)% remaining."
+        )
+    }
+
     func loadDoctorReport(fix: Bool = false) async {
         isDoctorLoading = true
         defer { isDoctorLoading = false }
@@ -495,6 +615,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
 
         profiles = sortProfiles(updatedProfiles)
+        updateSmartSwitchRecommendation()
     }
 
     private func applyOptimisticSwitch(to target: ProfileStatus) {
@@ -535,6 +656,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
         profiles = sortProfiles(profiles)
         lastRefresh = .now
+        updateSmartSwitchRecommendation()
     }
 
     private func queueSwitchReconcile(for profile: ProfileStatus, mode: SwitchMode) {
@@ -591,6 +713,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             return transform(profile)
         }
         profiles = sortProfiles(profiles)
+        updateSmartSwitchRecommendation()
     }
 
     private func sortProfiles(_ profiles: [ProfileStatus]) -> [ProfileStatus] {
@@ -671,6 +794,50 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
 
         persistOrdering()
+    }
+
+    private func loadNotificationInbox() {
+        guard let data = UserDefaults.standard.data(forKey: Preferences.notificationInboxKey) else {
+            notificationInboxItems = []
+            return
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let items = try? decoder.decode([NotificationInboxItem].self, from: data) {
+            notificationInboxItems = items
+        } else {
+            notificationInboxItems = []
+        }
+    }
+
+    private func persistNotificationInbox() {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(notificationInboxItems) else { return }
+        UserDefaults.standard.set(data, forKey: Preferences.notificationInboxKey)
+    }
+
+    private func recordInboxItem(
+        tone: NotificationInboxTone,
+        title: String,
+        body: String,
+        actionKind: NotificationInboxActionKind? = nil,
+        actionLabel: String? = nil,
+        targetProfileID: String? = nil
+    ) {
+        let item = NotificationInboxItem(
+            tone: tone,
+            title: title,
+            body: body,
+            actionKind: actionKind,
+            actionLabel: actionLabel,
+            targetProfileID: targetProfileID
+        )
+
+        notificationInboxItems.insert(item, at: 0)
+        notificationInboxItems = Array(notificationInboxItems.prefix(40))
+        persistNotificationInbox()
     }
 
     private func requestNotificationAuthorizationIfNeeded() async {
@@ -897,6 +1064,48 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         )
     }
 
+    private func updateSmartSwitchRecommendation() {
+        guard let currentProfile else {
+            recommendedSwitch = nil
+            return
+        }
+
+        let candidates = savedProfiles
+            .filter { !$0.isCurrent && $0.canSwitch }
+            .compactMap { profile -> (ProfileStatus, Int, Int)? in
+                guard let usagePercent = profile.usageDisplayPercent, usagePercent > 0 else { return nil }
+                let resetAt = profile.primaryUsageBucket?.nearestResetAt ?? Int.max
+                return (profile, usagePercent, resetAt)
+            }
+            .sorted { lhs, rhs in
+                if lhs.1 != rhs.1 {
+                    return lhs.1 > rhs.1
+                }
+                return lhs.2 > rhs.2
+            }
+
+        guard let best = candidates.first, let profileID = best.0.id else {
+            recommendedSwitch = nil
+            return
+        }
+
+        let reason: String
+        if currentProfile.isUsageDepleted {
+            reason = "Best fallback because the active profile is depleted."
+        } else if currentProfile.isLowUsage(threshold: notificationThreshold) {
+            reason = "Best backup while the active profile is running low."
+        } else {
+            reason = "Strongest standby profile based on remaining usage."
+        }
+
+        recommendedSwitch = ProfileSwitchRecommendation(
+            profileID: profileID,
+            profileName: best.0.primaryText,
+            usagePercent: best.1,
+            reason: reason
+        )
+    }
+
     private func evaluateUsageAlerts(trigger: RefreshTrigger) async {
         let notificationsEnabled = UserDefaults.standard.object(forKey: Preferences.notificationsEnabledKey) as? Bool ?? true
         guard notificationsEnabled else { return }
@@ -914,10 +1123,15 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         let isLow = currentProfile.isLowUsage(threshold: notificationThreshold)
         let wasLow = lowUsageNotifications[id] ?? false
         if isLow && !wasLow {
+            let recommendation = recommendedSwitch
             await scheduleNotification(
                 identifier: "low-usage-\(id)",
                 title: "Codex profile running low",
-                body: "\(currentProfile.primaryText) is at \(currentProfile.usageDisplayPercent ?? 0)% remaining."
+                body: "\(currentProfile.primaryText) is at \(currentProfile.usageDisplayPercent ?? 0)% remaining.",
+                inboxTone: .warning,
+                inboxActionKind: recommendation.map { _ in .switchToProfile },
+                inboxActionLabel: recommendation.map { "Switch to \($0.profileName)" },
+                inboxTargetProfileID: recommendation?.profileID
             )
         }
         lowUsageNotifications[id] = isLow
@@ -930,7 +1144,8 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             await scheduleNotification(
                 identifier: "reset-soon-\(id)",
                 title: "Codex usage resets soon",
-                body: "\(currentProfile.primaryText) has a usage bucket resetting within the next 6 hours."
+                body: "\(currentProfile.primaryText) has a usage bucket resetting within the next 6 hours.",
+                inboxTone: .info
             )
         }
         resetSoonNotifications[id] = resetSoon
@@ -963,7 +1178,10 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 identifier: "auto-switch-\(fallback.stableID)",
                 title: "Codex profile auto-switched",
                 body: "Now using \(fallback.primaryText) because the previous profile was depleted.",
-                categoryIdentifier: NotificationCategoryIdentifier.autoSwitch
+                categoryIdentifier: NotificationCategoryIdentifier.autoSwitch,
+                inboxTone: .success,
+                inboxActionKind: .reopenCodex,
+                inboxActionLabel: "Reopen Codex"
             )
         }
     }
@@ -972,8 +1190,23 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         identifier: String,
         title: String,
         body: String,
-        categoryIdentifier: String? = nil
+        categoryIdentifier: String? = nil,
+        inboxTone: NotificationInboxTone? = nil,
+        inboxActionKind: NotificationInboxActionKind? = nil,
+        inboxActionLabel: String? = nil,
+        inboxTargetProfileID: String? = nil
     ) async {
+        if let inboxTone {
+            recordInboxItem(
+                tone: inboxTone,
+                title: title,
+                body: body,
+                actionKind: inboxActionKind,
+                actionLabel: inboxActionLabel,
+                targetProfileID: inboxTargetProfileID
+            )
+        }
+
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -1411,36 +1644,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     }
 
     private func makeUpdateNotesView(for release: AppUpdateRelease) -> NSView {
-        let container = NSStackView()
-        container.orientation = .vertical
-        container.spacing = 10
-        container.alignment = .leading
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        let header = NSTextField(labelWithString: "Release notes")
-        header.font = .systemFont(ofSize: 12, weight: .semibold)
-        header.textColor = .secondaryLabelColor
-
-        let textView = NSTextView()
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.font = .systemFont(ofSize: 12)
-        textView.string = release.notes
-        textView.textColor = .labelColor
-        textView.textContainerInset = NSSize(width: 0, height: 4)
-
-        let scrollView = NSScrollView()
-        scrollView.borderType = .bezelBorder
-        scrollView.hasVerticalScroller = true
-        scrollView.drawsBackground = false
-        scrollView.documentView = textView
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.frame = NSRect(x: 0, y: 0, width: 420, height: 220)
-
-        container.addArrangedSubview(header)
-        container.addArrangedSubview(scrollView)
-        return container
+        UpdateNotesAccessoryView(notes: release.notes)
     }
 
     private func installUpdate(for release: AppUpdateRelease) async {
@@ -1605,6 +1809,68 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private struct SelfUpdateInstallation {
         let scriptURL: URL
+    }
+
+    private final class UpdateNotesAccessoryView: NSView {
+        private let fixedSize = NSSize(width: 420, height: 252)
+
+        override var intrinsicContentSize: NSSize {
+            fixedSize
+        }
+
+        init(notes: String) {
+            super.init(frame: NSRect(origin: .zero, size: fixedSize))
+            translatesAutoresizingMaskIntoConstraints = false
+
+            let titleLabel = NSTextField(labelWithString: "Release notes")
+            titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+            titleLabel.textColor = .secondaryLabelColor
+            titleLabel.lineBreakMode = .byTruncatingTail
+
+            let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: fixedSize.width - 24, height: 210))
+            textView.isEditable = false
+            textView.isSelectable = true
+            textView.drawsBackground = false
+            textView.font = .systemFont(ofSize: 12)
+            textView.string = notes
+            textView.textColor = .labelColor
+            textView.textContainerInset = NSSize(width: 0, height: 6)
+            textView.isVerticallyResizable = true
+            textView.isHorizontallyResizable = false
+            textView.autoresizingMask = [.width]
+            textView.textContainer?.containerSize = NSSize(width: fixedSize.width - 24, height: .greatestFiniteMagnitude)
+            textView.textContainer?.widthTracksTextView = true
+
+            let scrollView = NSScrollView()
+            scrollView.borderType = .bezelBorder
+            scrollView.hasVerticalScroller = true
+            scrollView.drawsBackground = false
+            scrollView.translatesAutoresizingMaskIntoConstraints = false
+            scrollView.documentView = textView
+
+            let stack = NSStackView(views: [titleLabel, scrollView])
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 10
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(stack)
+
+            NSLayoutConstraint.activate([
+                widthAnchor.constraint(equalToConstant: fixedSize.width),
+                heightAnchor.constraint(equalToConstant: fixedSize.height),
+                stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+                stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+                stack.topAnchor.constraint(equalTo: topAnchor),
+                stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+                scrollView.widthAnchor.constraint(equalToConstant: fixedSize.width),
+                scrollView.heightAnchor.constraint(equalToConstant: 220),
+            ])
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
     }
 
     private struct GitHubReleaseResponse: Decodable {

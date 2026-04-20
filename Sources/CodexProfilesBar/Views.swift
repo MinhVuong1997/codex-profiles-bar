@@ -5,41 +5,44 @@ import UniformTypeIdentifiers
 struct MenuBarRootView: View {
     @ObservedObject var model: CodexProfilesViewModel
     var isDetached = false
+    let resolvedColorScheme: ColorScheme
     @AppStorage(Preferences.showIDsKey) private var showIDs = false
     @AppStorage(Preferences.compactModeKey) private var compactMode = false
     @AppStorage(Preferences.groupingKey) private var groupingRaw = ProfileGrouping.none.rawValue
-    @AppStorage(Preferences.panelThemeKey) private var panelThemeRaw = PanelTheme.system.rawValue
     @AppStorage(Preferences.accentRedKey) private var accentRed = 0.15
     @AppStorage(Preferences.accentGreenKey) private var accentGreen = 0.44
     @AppStorage(Preferences.accentBlueKey) private var accentBlue = 0.95
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.colorScheme) private var systemColorScheme
 
     @State private var showImportPicker = false
     @State private var showSaveSheet = false
     @State private var showDoctorSheet = false
+    @State private var showInboxSheet = false
     @State private var showQuickSwitch = false
     @State private var selectedFilter: ProfileFilter = .all
     @State private var searchText = ""
     @State private var quickSwitchQuery = ""
     @State private var quickSwitchSelectionIndex = 0
+    @State private var bulkSelectionMode = false
+    @State private var bulkSelectedProfileIDs = Set<String>()
     @State private var selectedProfileID: String?
     @State private var labelEditorTarget: ProfileStatus?
     @State private var deleteTarget: ProfileStatus?
+    @State private var bulkDeleteTargets: [ProfileStatus] = []
     @State private var switchTarget: ProfileStatus?
     @State private var isImporting = false
     @State private var isExportingAll = false
     @State private var clearingLabelProfileID: String?
     @State private var localKeyMonitor: Any?
     @State private var localMouseMonitor: Any?
-
-    private var effectiveColorScheme: ColorScheme {
-        (PanelTheme(rawValue: panelThemeRaw) ?? .system).resolvedColorScheme(using: systemColorScheme)
-    }
+    @State private var pendingCenteredScrollProfileID: String?
+    @State private var pendingTopScrollRequest = 0
+    @State private var isTopScrollPending = false
+    private let scrollTopAnchorID = "profiles-scroll-top"
 
     private var palette: PanelPalette {
-        PanelPalette.resolve(for: effectiveColorScheme, accent: Color(red: accentRed, green: accentGreen, blue: accentBlue))
+        PanelPalette.resolve(for: resolvedColorScheme, accent: Color(red: accentRed, green: accentGreen, blue: accentBlue))
     }
 
     private var grouping: ProfileGrouping {
@@ -91,6 +94,17 @@ struct MenuBarRootView: View {
                 .zIndex(2)
             }
 
+            if showInboxSheet {
+                NotificationInboxOverlay(model: model) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                        showInboxSheet = false
+                    }
+                }
+                .padding(14)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(2)
+            }
+
             if showSaveSheet {
                 SaveProfileOverlay(model: model) {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
@@ -117,6 +131,17 @@ struct MenuBarRootView: View {
                 DeleteProfileOverlay(model: model, profile: profile, onClose: {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
                         deleteTarget = nil
+                    }
+                })
+                .padding(14)
+                .transition(.scale(scale: 0.96).combined(with: .opacity))
+                .zIndex(2)
+            }
+
+            if !bulkDeleteTargets.isEmpty {
+                DeleteProfilesOverlay(model: model, profiles: bulkDeleteTargets, onClose: {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                        bulkDeleteTargets = []
                     }
                 })
                 .padding(14)
@@ -166,13 +191,15 @@ struct MenuBarRootView: View {
             }
 
         }
-        .environment(\.colorScheme, effectiveColorScheme)
+        .environment(\.colorScheme, resolvedColorScheme)
         .animation(.spring(response: 0.32, dampingFraction: 0.84), value: model.banner?.id)
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: showDoctorSheet)
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: showInboxSheet)
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: showSaveSheet)
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: showQuickSwitch)
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: labelEditorTarget?.stableID)
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: deleteTarget?.stableID)
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: bulkDeleteTargets.map(\.stableID))
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: switchTarget?.stableID)
         .frame(
             minWidth: 460,
@@ -186,13 +213,15 @@ struct MenuBarRootView: View {
             installLocalKeyMonitorIfNeeded()
             installLocalMouseMonitorIfNeeded()
             ensureValidSelection()
+            requestTopScroll()
         }
         .onDisappear {
             removeLocalKeyMonitor()
             removeLocalMouseMonitor()
         }
-        .onChange(of: filteredProfiles.map(\.stableID)) { _, _ in
+        .onChange(of: navigableProfiles.map(\.stableID)) { _, ids in
             ensureValidSelection()
+            bulkSelectedProfileIDs = bulkSelectedProfileIDs.intersection(Set(ids))
         }
         .onChange(of: model.profiles.map(\.stableID)) { _, _ in
             ensureValidSelection()
@@ -206,6 +235,15 @@ struct MenuBarRootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .cycleProfilesShortcut)) { _ in
             Task { await model.cycleToNextProfile() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
+            guard let window = notification.object as? NSWindow else { return }
+            if isDetached {
+                guard window.identifier?.rawValue == "profiles-panel" else { return }
+            } else if window.identifier?.rawValue == "profiles-panel" {
+                return
+            }
+            requestTopScroll()
         }
         .fileImporter(
             isPresented: $showImportPicker,
@@ -235,10 +273,12 @@ struct MenuBarRootView: View {
 
     private var activeOverlayKind: String? {
         if showDoctorSheet { return "doctor" }
+        if showInboxSheet { return "inbox" }
         if showSaveSheet { return "save" }
         if showQuickSwitch { return "quick-switch" }
         if labelEditorTarget != nil { return "label" }
         if deleteTarget != nil { return "delete" }
+        if !bulkDeleteTargets.isEmpty { return "bulk-delete" }
         if switchTarget != nil { return "switch" }
         if model.codexRelaunchPrompt != nil { return "relaunch" }
         return nil
@@ -248,6 +288,8 @@ struct MenuBarRootView: View {
         withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
             if switchTarget != nil {
                 switchTarget = nil
+            } else if !bulkDeleteTargets.isEmpty {
+                bulkDeleteTargets = []
             } else if deleteTarget != nil {
                 deleteTarget = nil
             } else if labelEditorTarget != nil {
@@ -258,6 +300,8 @@ struct MenuBarRootView: View {
                 showQuickSwitch = false
             } else if showSaveSheet {
                 showSaveSheet = false
+            } else if showInboxSheet {
+                showInboxSheet = false
             } else if showDoctorSheet {
                 showDoctorSheet = false
             }
@@ -274,23 +318,6 @@ struct MenuBarRootView: View {
 
                     RefreshActivityBadge(isRefreshing: model.isRefreshingProfiles)
                 }
-
-                Text(model.detectedCodexVersion.summary)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(palette.secondaryText)
-                    .lineLimit(1)
-
-                if let storage = model.detectedStorage {
-                    Text("Managing profiles directly in \(storage.url.path)")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(palette.tertiaryText)
-                        .lineLimit(2)
-                } else {
-                    Text("Managing profiles directly in your Codex home.")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(palette.tertiaryText)
-                        .lineLimit(2)
-                }
             }
 
             Spacer()
@@ -301,6 +328,28 @@ struct MenuBarRootView: View {
                 }
                 .disabled(model.isRefreshingProfiles)
                 .help(model.isRefreshingProfiles ? "Refreshing profiles…" : "Refresh profiles")
+
+                Button {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                        showInboxSheet = true
+                    }
+                    model.markAllInboxItemsRead()
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: model.unreadInboxCount > 0 ? "bell.badge.fill" : "bell")
+
+                        if model.unreadInboxCount > 0 {
+                            Text("\(min(model.unreadInboxCount, 9))")
+                                .font(.system(size: 8, weight: .bold, design: .rounded))
+                                .foregroundStyle(.white)
+                                .padding(4)
+                                .background(Circle().fill(palette.warning))
+                                .offset(x: 5, y: -5)
+                        }
+                    }
+                }
+                .buttonStyle(IconButtonStyle())
+                .help(model.unreadInboxCount > 0 ? "Open inbox (\(model.unreadInboxCount) unread)" : "Open notification inbox")
 
                 if !isDetached {
                     Button {
@@ -371,6 +420,29 @@ struct MenuBarRootView: View {
             HStack(spacing: 10) {
                 SearchField(text: $searchText, palette: palette)
                 filterCountBadge
+                Button {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                        bulkSelectionMode.toggle()
+                    }
+                    if !bulkSelectionMode {
+                        bulkSelectedProfileIDs.removeAll()
+                    }
+                } label: {
+                    Text(bulkSelectionMode ? "Done" : "Select")
+                        .font(.system(.caption, design: .rounded, weight: .bold))
+                        .foregroundStyle(bulkSelectionMode ? Color.white : palette.primaryText)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(
+                            Capsule()
+                                .fill(bulkSelectionMode ? palette.accent : palette.subtleFill)
+                                .overlay(
+                                    Capsule()
+                                        .stroke(bulkSelectionMode ? palette.accent.opacity(0.4) : palette.cardStroke, lineWidth: 1)
+                                )
+                        )
+                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -391,12 +463,52 @@ struct MenuBarRootView: View {
             )
             Spacer()
         } else {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 12, pinnedViews: [.sectionHeaders]) {
-                        Section {
+            VStack(spacing: 0) {
+                filterBarHeader
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            Color.clear
+                                .frame(height: 1)
+                                .id(scrollTopAnchorID)
+
+                            if let currentProfile = model.currentProfile {
+                                ActiveProfileSpotlightCard(
+                                    profile: currentProfile,
+                                    showID: showIDs,
+                                    isFavorite: model.isFavorite(currentProfile),
+                                    sparklineValues: model.usageHistoryByProfileID[currentProfile.id ?? ""]?.sparklinePercentages ?? [],
+                                    healthBadges: healthBadges(for: currentProfile),
+                                    recommendation: model.recommendedSwitch,
+                                    isRestartingCodex: model.isRestartingCodex,
+                                    onToggleFavorite: {
+                                        model.toggleFavorite(currentProfile)
+                                    },
+                                    onReopen: {
+                                        Task { _ = await model.restartCodex() }
+                                    },
+                                    onSwitchRecommended: {
+                                        guard let recommendation = model.recommendedSwitch,
+                                              let profile = model.savedProfiles.first(where: { $0.id == recommendation.profileID }) else {
+                                            return
+                                        }
+                                        selectedProfileID = profile.stableID
+                                        if model.hasUnsavedCurrentProfile {
+                                            switchTarget = profile
+                                        } else {
+                                            Task { await model.switchToProfile(profile, mode: .standard) }
+                                        }
+                                    }
+                                )
+                            }
+
                             if let aggregateUsage = model.aggregateUsage {
                                 AggregateUsageCard(summary: aggregateUsage, palette: palette)
+                            }
+
+                            if bulkSelectionMode {
+                                bulkActionBar
                             }
 
                             if let lastRefresh = model.lastRefresh {
@@ -416,10 +528,10 @@ struct MenuBarRootView: View {
                                 }
                             }
 
-                            if filteredProfiles.isEmpty {
+                            if navigableProfiles.isEmpty {
                                 EmptyStateView(
-                                    title: "No profiles match this filter",
-                                    message: "Try switching back to All, clearing search, or saving profiles that still have remaining usage."
+                                    title: "No additional profiles match this filter",
+                                    message: "Try switching back to All, clearing search, or saving more profiles. Your active session stays pinned above for quick access."
                                 )
                                 .padding(.top, 30)
                             } else {
@@ -439,7 +551,10 @@ struct MenuBarRootView: View {
                                             isFavorite: model.isFavorite(profile),
                                             isCompact: compactMode,
                                             sparklineValues: model.usageHistoryByProfileID[profile.id ?? ""]?.sparklinePercentages ?? [],
+                                            healthBadges: healthBadges(for: profile),
                                             isSelected: selectedProfileID == profile.stableID,
+                                            isBulkMode: bulkSelectionMode,
+                                            isBulkSelected: bulkSelectedProfileIDs.contains(profile.stableID),
                                             isSwitching: model.switchingProfileID == profile.id,
                                             isSwitchDisabled: model.switchingProfileID != nil,
                                             isClearingLabel: clearingLabelProfileID == profile.stableID,
@@ -456,7 +571,11 @@ struct MenuBarRootView: View {
                                                 model.toggleFavorite(profile)
                                             },
                                             onSelect: {
-                                                selectedProfileID = profile.stableID
+                                                if bulkSelectionMode {
+                                                    toggleBulkSelection(for: profile)
+                                                } else {
+                                                    selectedProfileID = profile.stableID
+                                                }
                                             },
                                             onEditLabel: {
                                                 selectedProfileID = profile.stableID
@@ -486,27 +605,70 @@ struct MenuBarRootView: View {
                                             onDelete: {
                                                 selectedProfileID = profile.stableID
                                                 deleteTarget = profile
+                                            },
+                                            onToggleBulkSelection: {
+                                                toggleBulkSelection(for: profile)
                                             }
                                         )
                                         .id(profile.stableID)
                                     }
                                 }
                             }
-                        } header: {
-                            filterBarHeader
+                        }
+                        .padding(.bottom, 8)
+                    }
+                    .scrollIndicators(.hidden)
+                    .onChange(of: pendingCenteredScrollProfileID) { _, id in
+                        guard let id else { return }
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                        DispatchQueue.main.async {
+                            pendingCenteredScrollProfileID = nil
                         }
                     }
-                    .padding(.bottom, 8)
-                }
-                .scrollIndicators(.hidden)
-                .onChange(of: selectedProfileID) { _, id in
-                    guard let id else { return }
-                    withAnimation(.easeInOut(duration: 0.16)) {
-                        proxy.scrollTo(id, anchor: .center)
+                    .onChange(of: pendingTopScrollRequest) { _, _ in
+                        scrollToTop(using: proxy, animated: false)
+                    }
+                    .onChange(of: navigableProfiles.map(\.stableID)) { _, _ in
+                        guard isTopScrollPending else { return }
+                        scrollToTop(using: proxy, animated: false)
+                        DispatchQueue.main.async {
+                            isTopScrollPending = false
+                        }
                     }
                 }
             }
         }
+    }
+
+    private func scrollToTop(using proxy: ScrollViewProxy, animated: Bool = true) {
+        let performScroll = {
+            proxy.scrollTo(scrollTopAnchorID, anchor: .top)
+        }
+
+        if animated {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                performScroll()
+            }
+        } else {
+            performScroll()
+        }
+
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    performScroll()
+                }
+            } else {
+                performScroll()
+            }
+        }
+    }
+
+    private func requestTopScroll() {
+        isTopScrollPending = true
+        pendingTopScrollRequest += 1
     }
 
     private func presentSavePanel(suggestedName: String) -> URL? {
@@ -642,6 +804,31 @@ struct MenuBarRootView: View {
             }
         }
 
+        if bulkSelectionMode {
+            switch event.keyCode {
+            case 125:
+                moveSelection(delta: 1)
+                return nil
+            case 126:
+                moveSelection(delta: -1)
+                return nil
+            case 49:
+                if let selectedProfile {
+                    toggleBulkSelection(for: selectedProfile)
+                }
+                return nil
+            case 51:
+                presentBulkDelete()
+                return nil
+            case 53:
+                bulkSelectionMode = false
+                bulkSelectedProfileIDs.removeAll()
+                return nil
+            default:
+                return event
+            }
+        }
+
         switch event.keyCode {
         case 125:
             moveSelection(delta: 1)
@@ -722,20 +909,22 @@ struct MenuBarRootView: View {
     }
 
     private func ensureValidSelection() {
-        if let selectedProfileID, filteredProfiles.contains(where: { $0.stableID == selectedProfileID }) {
+        if let selectedProfileID, navigableProfiles.contains(where: { $0.stableID == selectedProfileID }) {
             return
         }
-        selectedProfileID = filteredProfiles.first?.stableID
+        selectedProfileID = navigableProfiles.first?.stableID
     }
 
     private func moveSelection(delta: Int) {
-        guard !filteredProfiles.isEmpty else { return }
-        let currentIndex = filteredProfiles.firstIndex(where: { $0.stableID == selectedProfileID }) ?? 0
-        let nextIndex = max(0, min(filteredProfiles.count - 1, currentIndex + delta))
-        selectedProfileID = filteredProfiles[nextIndex].stableID
+        guard !navigableProfiles.isEmpty else { return }
+        let currentIndex = navigableProfiles.firstIndex(where: { $0.stableID == selectedProfileID }) ?? 0
+        let nextIndex = max(0, min(navigableProfiles.count - 1, currentIndex + delta))
+        selectedProfileID = navigableProfiles[nextIndex].stableID
+        pendingCenteredScrollProfileID = selectedProfileID
     }
 
     private func activateSelectedProfile() {
+        guard !bulkSelectionMode else { return }
         guard let profile = selectedProfile else { return }
         guard !profile.isCurrent else { return }
         if model.hasUnsavedCurrentProfile {
@@ -756,8 +945,27 @@ struct MenuBarRootView: View {
     }
 
     private func deleteSelectedProfile() {
+        guard !bulkSelectionMode else {
+            presentBulkDelete()
+            return
+        }
         guard let profile = selectedProfile, profile.isSaved else { return }
         deleteTarget = profile
+    }
+
+    private func toggleBulkSelection(for profile: ProfileStatus) {
+        if bulkSelectedProfileIDs.contains(profile.stableID) {
+            bulkSelectedProfileIDs.remove(profile.stableID)
+        } else {
+            bulkSelectedProfileIDs.insert(profile.stableID)
+        }
+        selectedProfileID = profile.stableID
+    }
+
+    private func presentBulkDelete() {
+        let targets = selectedBulkProfiles.filter(\.isSaved)
+        guard !targets.isEmpty else { return }
+        bulkDeleteTargets = targets
     }
 
     private func triggerQuickSwitch(_ profile: ProfileStatus) {
@@ -794,12 +1002,16 @@ struct MenuBarRootView: View {
         }
     }
 
+    private var navigableProfiles: [ProfileStatus] {
+        filteredProfiles.filter { !$0.isCurrent }
+    }
+
     private var groupedProfiles: [ProfileGroup] {
         switch grouping {
         case .none:
-            return [ProfileGroup(title: "All", profiles: filteredProfiles)]
+            return [ProfileGroup(title: "All", profiles: navigableProfiles)]
         case .plan:
-            let grouped = Dictionary(grouping: filteredProfiles, by: \.planGroupTitle)
+            let grouped = Dictionary(grouping: navigableProfiles, by: \.planGroupTitle)
             return grouped.keys.sorted().map { key in
                 ProfileGroup(title: key, profiles: grouped[key] ?? [])
             }
@@ -815,9 +1027,52 @@ struct MenuBarRootView: View {
 
     private var selectedProfile: ProfileStatus? {
         if let selectedProfileID {
-            return filteredProfiles.first(where: { $0.stableID == selectedProfileID })
+            return navigableProfiles.first(where: { $0.stableID == selectedProfileID })
         }
-        return filteredProfiles.first
+        return navigableProfiles.first
+    }
+
+    private var selectedBulkProfiles: [ProfileStatus] {
+        model.profiles.filter { bulkSelectedProfileIDs.contains($0.stableID) }
+    }
+
+    private var shouldRemoveFavoritesInBulk: Bool {
+        let selectedIDs = Set(selectedBulkProfiles.compactMap(\.id))
+        return !selectedIDs.isEmpty && selectedIDs.allSatisfy { id in
+            model.savedProfiles.contains(where: { $0.id == id && model.isFavorite($0) })
+        }
+    }
+
+    private func healthBadges(for profile: ProfileStatus) -> [ProfileHealthBadgeDescriptor] {
+        var badges = [ProfileHealthBadgeDescriptor]()
+
+        if profile.isCurrent {
+            badges.append(.init(title: "Active", symbol: "checkmark.circle.fill", tone: .success))
+        }
+
+        if profile.error != nil {
+            badges.append(.init(title: "Needs repair", symbol: "wrench.and.screwdriver.fill", tone: .error))
+        } else if profile.isUsageDepleted {
+            badges.append(.init(title: "Depleted", symbol: "bolt.horizontal.circle.fill", tone: .error))
+        } else if profile.isLowUsage(threshold: model.notificationThreshold) {
+            badges.append(.init(title: "Low usage", symbol: "exclamationmark.triangle.fill", tone: .warning))
+        }
+
+        if profile.resetsSoon {
+            badges.append(.init(title: "Resets soon", symbol: "clock.badge.exclamationmark.fill", tone: .info))
+        }
+
+        if profile.isCurrent && !profile.isSaved {
+            badges.append(.init(title: "Unsaved", symbol: "square.and.arrow.down.badge.exclamationmark", tone: .warning))
+        } else if !profile.hasUsageData && profile.error == nil {
+            badges.append(.init(title: "No usage data", symbol: "waveform.path.ecg", tone: .info))
+        }
+
+        if !profile.warnings.isEmpty {
+            badges.append(.init(title: "Attention", symbol: "exclamationmark.circle.fill", tone: .warning))
+        }
+
+        return badges
     }
 
     private var filterBar: some View {
@@ -828,6 +1083,7 @@ struct MenuBarRootView: View {
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                             selectedFilter = filter
                         }
+                        requestTopScroll()
                     } label: {
                         Text(filter.title)
                             .font(.system(.caption, design: .rounded, weight: .bold))
@@ -878,7 +1134,7 @@ struct MenuBarRootView: View {
     private var filterBarHeader: some View {
         filterBar
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 8)
+            .padding(.bottom, 8)
             .background(
                 LinearGradient(
                     colors: [palette.backgroundStart, palette.backgroundEnd],
@@ -903,6 +1159,61 @@ struct MenuBarRootView: View {
                     )
             )
     }
+
+    private var bulkActionBar: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(selectedBulkProfiles.count) selected")
+                        .font(.system(.headline, design: .rounded, weight: .bold))
+                        .foregroundStyle(palette.primaryText)
+                    Text("Favorite, export, or delete several saved profiles at once.")
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(palette.secondaryText)
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 10) {
+                ActionButton(
+                    title: shouldRemoveFavoritesInBulk ? "Remove favorite" : "Add favorite",
+                    symbol: shouldRemoveFavoritesInBulk ? "star.slash" : "star.fill"
+                ) {
+                    let selectedIDs = Set(selectedBulkProfiles.compactMap(\.id))
+                    model.setFavoriteState(for: selectedIDs, isFavorite: !shouldRemoveFavoritesInBulk)
+                }
+                .disabled(selectedBulkProfiles.compactMap(\.id).isEmpty)
+
+                ActionButton(title: "Export Selected", symbol: "square.and.arrow.up") {
+                    Task {
+                        let selectedIDs = selectedBulkProfiles.compactMap(\.id)
+                        guard !selectedIDs.isEmpty,
+                              let url = presentSavePanel(suggestedName: "codex-selected-profiles.json") else { return }
+                        _ = await model.exportProfiles(
+                            ids: selectedIDs,
+                            to: url,
+                            descriptor: "\(selectedIDs.count) selected profiles"
+                        )
+                    }
+                }
+                .disabled(selectedBulkProfiles.compactMap(\.id).isEmpty)
+
+                ActionButton(title: "Delete Selected", symbol: "trash") {
+                    presentBulkDelete()
+                }
+                .disabled(selectedBulkProfiles.filter(\.isSaved).isEmpty)
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(palette.cardFill)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(palette.cardStroke, lineWidth: 1)
+                )
+        )
+    }
 }
 
 struct ProfileCard: View {
@@ -911,7 +1222,10 @@ struct ProfileCard: View {
     let isFavorite: Bool
     let isCompact: Bool
     let sparklineValues: [Int]
+    let healthBadges: [ProfileHealthBadgeDescriptor]
     let isSelected: Bool
+    let isBulkMode: Bool
+    let isBulkSelected: Bool
     let isSwitching: Bool
     let isSwitchDisabled: Bool
     let isClearingLabel: Bool
@@ -922,6 +1236,7 @@ struct ProfileCard: View {
     let onClearLabel: () -> Void
     let onExport: () -> Void
     let onDelete: () -> Void
+    let onToggleBulkSelection: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
     private var palette: PanelPalette {
@@ -931,6 +1246,16 @@ struct ProfileCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: isCompact ? 10 : 14) {
             HStack(alignment: .top, spacing: 14) {
+                if isBulkMode {
+                    Button(action: onToggleBulkSelection) {
+                        Image(systemName: isBulkSelected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(isBulkSelected ? palette.accent : palette.secondaryText)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 4)
+                }
+
                 Circle()
                     .fill(toneColor.opacity(0.22))
                     .frame(width: isCompact ? 34 : 40, height: isCompact ? 34 : 40)
@@ -973,6 +1298,13 @@ struct ProfileCard: View {
                         .foregroundStyle(palette.secondaryText)
                         .lineLimit(isCompact ? 2 : 3)
                         .padding(.top, profile.secondaryText.isEmpty && profile.id == nil ? 2 : 0)
+
+                    if !healthBadges.isEmpty {
+                        HealthBadgesRow(
+                            badges: Array(healthBadges.prefix(isCompact ? 2 : 3)),
+                            palette: palette
+                        )
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -1003,7 +1335,17 @@ struct ProfileCard: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .trailing)
 
-                    if profile.canSwitch {
+                    if isBulkMode {
+                        Text(isBulkSelected ? "Selected" : "Select")
+                            .font(.system(.caption, design: .rounded, weight: .semibold))
+                            .foregroundStyle(isBulkSelected ? Color.white : palette.secondaryText)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule()
+                                    .fill(isBulkSelected ? palette.accent : palette.subtleFill)
+                            )
+                    } else if profile.canSwitch {
                         Button {
                             onSwitch()
                         } label: {
@@ -1035,47 +1377,49 @@ struct ProfileCard: View {
                             .background(palette.subtleFill, in: Capsule())
                     }
 
-                    Menu {
-                        if profile.isSaved {
-                            Button(isFavorite ? "Remove favorite" : "Add favorite", systemImage: isFavorite ? "star.slash" : "star") {
-                                onToggleFavorite()
-                            }
-                            Button("Edit label", systemImage: "pencil") {
-                                onEditLabel()
-                            }
-
-                            if profile.label != nil {
-                                Button("Clear label", systemImage: "tag.slash") {
-                                    onClearLabel()
+                    if !isBulkMode {
+                        Menu {
+                            if profile.isSaved {
+                                Button(isFavorite ? "Remove favorite" : "Add favorite", systemImage: isFavorite ? "star.slash" : "star") {
+                                    onToggleFavorite()
                                 }
-                                .disabled(isClearingLabel)
-                            }
+                                Button("Edit label", systemImage: "pencil") {
+                                    onEditLabel()
+                                }
 
-                            Button("Export JSON", systemImage: "square.and.arrow.up") {
-                                onExport()
-                            }
+                                if profile.label != nil {
+                                    Button("Clear label", systemImage: "tag.slash") {
+                                        onClearLabel()
+                                    }
+                                    .disabled(isClearingLabel)
+                                }
 
-                            Divider()
+                                Button("Export JSON", systemImage: "square.and.arrow.up") {
+                                    onExport()
+                                }
 
-                            Button("Delete profile", systemImage: "trash", role: .destructive) {
-                                onDelete()
+                                Divider()
+
+                                Button("Delete profile", systemImage: "trash", role: .destructive) {
+                                    onDelete()
+                                }
+                            } else {
+                                Text("Save current session first")
                             }
-                        } else {
-                            Text("Save current session first")
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "ellipsis.circle")
+                                    .font(.system(size: 16, weight: .medium))
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 10, weight: .bold))
+                            }
+                            .foregroundStyle(palette.primaryText.opacity(0.92))
+                            .padding(.horizontal, 2)
                         }
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "ellipsis.circle")
-                                .font(.system(size: 16, weight: .medium))
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 10, weight: .bold))
-                        }
-                        .foregroundStyle(palette.primaryText.opacity(0.92))
-                        .padding(.horizontal, 2)
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
                     }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
                 }
                 .frame(minWidth: 112, alignment: .trailing)
             }
@@ -1135,6 +1479,9 @@ struct ProfileCard: View {
         if isSwitching {
             return palette.success.opacity(0.78)
         }
+        if isBulkSelected {
+            return palette.accent.opacity(0.95)
+        }
         if isSelected {
             return palette.accent.opacity(0.9)
         }
@@ -1156,17 +1503,247 @@ struct ProfileCard: View {
     }
 }
 
+enum ProfileHealthBadgeTone {
+    case info
+    case success
+    case warning
+    case error
+}
+
+struct ProfileHealthBadgeDescriptor: Identifiable, Hashable {
+    let title: String
+    let symbol: String
+    let tone: ProfileHealthBadgeTone
+
+    var id: String { "\(title)-\(symbol)" }
+}
+
+struct HealthBadgesRow: View {
+    let badges: [ProfileHealthBadgeDescriptor]
+    let palette: PanelPalette
+
+    var body: some View {
+        FlowLayout(spacing: 6, lineSpacing: 6) {
+            ForEach(badges) { badge in
+                HStack(spacing: 5) {
+                    Image(systemName: badge.symbol)
+                        .font(.system(size: 10, weight: .bold))
+                    Text(badge.title)
+                        .font(.system(.caption2, design: .rounded, weight: .bold))
+                }
+                .foregroundStyle(foregroundColor(for: badge.tone))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(backgroundColor(for: badge.tone), in: Capsule())
+            }
+        }
+    }
+
+    private func foregroundColor(for tone: ProfileHealthBadgeTone) -> Color {
+        switch tone {
+        case .info:
+            palette.secondaryText
+        case .success:
+            palette.success
+        case .warning:
+            palette.warning
+        case .error:
+            palette.danger
+        }
+    }
+
+    private func backgroundColor(for tone: ProfileHealthBadgeTone) -> Color {
+        switch tone {
+        case .info:
+            palette.subtleFill
+        case .success:
+            palette.success.opacity(0.12)
+        case .warning:
+            palette.warning.opacity(0.14)
+        case .error:
+            palette.danger.opacity(0.14)
+        }
+    }
+}
+
+struct ActiveProfileSpotlightCard: View {
+    let profile: ProfileStatus
+    let showID: Bool
+    let isFavorite: Bool
+    let sparklineValues: [Int]
+    let healthBadges: [ProfileHealthBadgeDescriptor]
+    let recommendation: ProfileSwitchRecommendation?
+    let isRestartingCodex: Bool
+    let onToggleFavorite: () -> Void
+    let onReopen: () -> Void
+    let onSwitchRecommended: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var palette: PanelPalette {
+        PanelPalette.resolve(for: colorScheme)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Active Session")
+                        .font(.system(.caption, design: .monospaced, weight: .bold))
+                        .foregroundStyle(palette.accent)
+                    HStack(spacing: 8) {
+                        Text(profile.primaryText)
+                            .font(.system(.title3, design: .rounded, weight: .bold))
+                            .foregroundStyle(palette.primaryText)
+                            .lineLimit(1)
+                        if let percent = profile.usageDisplayPercent {
+                            Text("\(percent)% left")
+                                .font(.system(.caption, design: .rounded, weight: .bold))
+                                .foregroundStyle(palette.success)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(palette.success.opacity(0.12), in: Capsule())
+                        }
+                    }
+                    Text(profile.statusLabel)
+                        .font(.system(.subheadline, design: .rounded, weight: .medium))
+                        .foregroundStyle(palette.secondaryText)
+                    if !healthBadges.isEmpty {
+                        HealthBadgesRow(badges: healthBadges, palette: palette)
+                    }
+                }
+
+                Spacer()
+
+                HStack(spacing: 8) {
+                    if sparklineValues.count >= 3 {
+                        SparklineView(values: sparklineValues, color: palette.success)
+                            .frame(width: 62, height: 20)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule()
+                                    .fill(palette.subtleFill)
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(palette.cardStroke, lineWidth: 1)
+                                    )
+                            )
+                    }
+
+                    Button(action: onToggleFavorite) {
+                        Image(systemName: isFavorite ? "star.fill" : "star")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(isFavorite ? palette.warning : palette.secondaryText)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if !profile.secondaryText.isEmpty || (showID && profile.id != nil) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if !profile.secondaryText.isEmpty {
+                        Text(profile.secondaryText)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+
+                    if showID, let id = profile.id {
+                        Text(id)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(palette.tertiaryText)
+                    }
+                }
+            }
+
+            if let usage = profile.usage, usage.state == "ok", let bucket = profile.primaryUsageBucket {
+                VStack(spacing: 8) {
+                    UsageMeterRow(title: bucket.label, windowTitle: "5h", window: bucket.fiveHour)
+                    UsageMeterRow(title: bucket.label, windowTitle: "Weekly", window: bucket.weekly)
+                }
+            }
+
+            if let recommendation {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Smart switch recommendation")
+                            .font(.system(.caption, design: .monospaced, weight: .bold))
+                            .foregroundStyle(palette.accent)
+                        Text("\(recommendation.profileName) has \(recommendation.usagePercent)% remaining.")
+                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+                        Text(recommendation.reason)
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        onSwitchRecommended()
+                    } label: {
+                        Text("Switch to backup")
+                            .font(.system(.caption, design: .rounded, weight: .bold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(palette.subtleFill)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(palette.cardStroke, lineWidth: 1)
+                        )
+                )
+            }
+
+            HStack(spacing: 10) {
+                Button(action: onReopen) {
+                    HStack(spacing: 8) {
+                        if isRestartingCodex {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "arrow.clockwise.circle.fill")
+                        }
+                        Text(isRestartingCodex ? "Reopening…" : "Reopen Codex")
+                            .font(.system(.caption, design: .rounded, weight: .bold))
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SwitchButtonStyle(isActive: isRestartingCodex))
+                .disabled(isRestartingCodex)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [palette.cardFill, palette.subtleFill.opacity(1.2)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(palette.accent.opacity(0.45), lineWidth: 1.2)
+                )
+        )
+    }
+}
+
 struct SearchField: View {
     @Binding var text: String
     let palette: PanelPalette
+    var focusBinding: FocusState<Bool>.Binding? = nil
 
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(palette.secondaryText)
-            TextField("Search label, email, plan…", text: $text)
-                .textFieldStyle(.plain)
-                .foregroundStyle(palette.primaryText)
+            searchTextField
             if !text.isEmpty {
                 Button {
                     text = ""
@@ -1187,6 +1764,20 @@ struct SearchField: View {
                         .stroke(palette.cardStroke, lineWidth: 1)
                 )
         )
+    }
+
+    @ViewBuilder
+    private var searchTextField: some View {
+        if let focusBinding {
+            TextField("Search label, email, plan…", text: $text)
+                .textFieldStyle(.plain)
+                .foregroundStyle(palette.primaryText)
+                .focused(focusBinding)
+        } else {
+            TextField("Search label, email, plan…", text: $text)
+                .textFieldStyle(.plain)
+                .foregroundStyle(palette.primaryText)
+        }
     }
 }
 
@@ -1319,8 +1910,7 @@ struct QuickSwitchOverlay: View {
                     .buttonStyle(IconButtonStyle())
                 }
 
-                SearchField(text: $query, palette: palette)
-                    .focused($isSearchFocused)
+                SearchField(text: $query, palette: palette, focusBinding: $isSearchFocused)
 
                 ScrollView {
                     VStack(spacing: 8) {
@@ -1567,6 +2157,76 @@ struct DeleteProfileOverlay: View {
     }
 }
 
+struct DeleteProfilesOverlay: View {
+    @ObservedObject var model: CodexProfilesViewModel
+    let profiles: [ProfileStatus]
+    let onClose: () -> Void
+    @State private var isDeleting = false
+
+    var body: some View {
+        OverlayCard {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Delete selected profiles?")
+                    .font(.system(.title3, design: .rounded, weight: .bold))
+
+                Text("\(profiles.count) saved profiles will be removed from Codex Profiles.")
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(profiles.prefix(4)), id: \.stableID) { profile in
+                        Text("• \(profile.primaryText)")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if profiles.count > 4 {
+                        Text("• and \(profiles.count - 4) more")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text("This action cannot be undone.")
+                    .font(.system(.caption, design: .rounded, weight: .semibold))
+                    .foregroundStyle(.red)
+
+                HStack {
+                    Spacer()
+                    Button("Cancel") {
+                        onClose()
+                    }
+                    .disabled(isDeleting)
+                    Button(role: .destructive, action: {
+                        guard !isDeleting else { return }
+                        isDeleting = true
+                        Task {
+                            let didDelete = await model.deleteProfiles(profiles)
+                            await MainActor.run {
+                                isDeleting = false
+                                if didDelete {
+                                    onClose()
+                                }
+                            }
+                        }
+                    }) {
+                        HStack(spacing: 8) {
+                            if isDeleting {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Text(isDeleting ? "Deleting…" : "Delete selected")
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .tint(.red)
+                    .disabled(isDeleting)
+                }
+            }
+            .frame(width: 360)
+        }
+    }
+}
+
 struct UnsavedSwitchOverlay: View {
     @ObservedObject var model: CodexProfilesViewModel
     let profile: ProfileStatus
@@ -1805,8 +2465,213 @@ struct DoctorOverlay: View {
     }
 }
 
+struct NotificationInboxOverlay: View {
+    @ObservedObject var model: CodexProfilesViewModel
+    let onClose: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var palette: PanelPalette {
+        PanelPalette.resolve(for: colorScheme)
+    }
+
+    var body: some View {
+        OverlayCard {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Notification Inbox")
+                            .font(.system(.title3, design: .rounded, weight: .bold))
+                        Text("Important alerts, auto-switch events, and recommended follow-up actions.")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(IconButtonStyle())
+                }
+
+                if model.notificationInboxItems.isEmpty {
+                    EmptyStateView(
+                        title: "No notifications yet",
+                        message: "Low-usage alerts, reset reminders, and auto-switch events will appear here."
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 220)
+                } else {
+                    HStack(spacing: 10) {
+                        Button("Mark all read") {
+                            model.markAllInboxItemsRead()
+                        }
+                        .disabled(model.unreadInboxCount == 0)
+
+                        Button("Clear inbox") {
+                            model.clearNotificationInbox()
+                        }
+
+                        Spacer()
+
+                        Text("\(model.notificationInboxItems.count) items")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+
+                    ScrollView {
+                        VStack(spacing: 10) {
+                            ForEach(model.notificationInboxItems) { item in
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack(alignment: .top, spacing: 10) {
+                                        Circle()
+                                            .fill(toneColor(for: item.tone).opacity(0.18))
+                                            .frame(width: 30, height: 30)
+                                            .overlay(
+                                                Image(systemName: toneSymbol(for: item.tone))
+                                                    .font(.system(size: 12, weight: .bold))
+                                                    .foregroundStyle(toneColor(for: item.tone))
+                                            )
+
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            HStack {
+                                                Text(item.title)
+                                                    .font(.system(.headline, design: .rounded, weight: .semibold))
+                                                    .foregroundStyle(palette.primaryText)
+                                                if item.isUnread {
+                                                    Circle()
+                                                        .fill(palette.accent)
+                                                        .frame(width: 8, height: 8)
+                                                }
+                                                Spacer()
+                                                Text(item.createdAt.formatted(.relative(presentation: .named)))
+                                                    .font(.system(.caption2, design: .monospaced))
+                                                    .foregroundStyle(palette.tertiaryText)
+                                            }
+
+                                            Text(item.body)
+                                                .font(.system(.caption, design: .rounded))
+                                                .foregroundStyle(palette.secondaryText)
+                                        }
+                                    }
+
+                                    HStack(spacing: 10) {
+                                        if let actionLabel = item.actionLabel, item.actionKind != nil {
+                                            Button(actionLabel) {
+                                                Task {
+                                                    _ = await model.performInboxAction(for: item)
+                                                }
+                                            }
+                                            .buttonStyle(.borderedProminent)
+                                        }
+
+                                        if item.isUnread {
+                                            Button("Mark read") {
+                                                model.markInboxItemRead(item)
+                                            }
+                                        }
+
+                                        Spacer()
+                                    }
+                                }
+                                .padding(12)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .fill(palette.subtleFill)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                                .stroke(item.isUnread ? palette.accent.opacity(0.35) : palette.cardStroke, lineWidth: 1)
+                                        )
+                                )
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 380)
+                }
+            }
+        }
+        .frame(maxWidth: 420, maxHeight: 560)
+    }
+
+    private func toneColor(for tone: NotificationInboxTone) -> Color {
+        switch tone {
+        case .info:
+            palette.accent
+        case .success:
+            palette.success
+        case .warning:
+            palette.warning
+        case .error:
+            palette.danger
+        }
+    }
+
+    private func toneSymbol(for tone: NotificationInboxTone) -> String {
+        switch tone {
+        case .info:
+            "bell.fill"
+        case .success:
+            "checkmark.circle.fill"
+        case .warning:
+            "exclamationmark.triangle.fill"
+        case .error:
+            "xmark.octagon.fill"
+        }
+    }
+}
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+    var lineSpacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .greatestFiniteMagnitude
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var currentLineHeight: CGFloat = 0
+        var maxLineWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > maxWidth, currentX > 0 {
+                maxLineWidth = max(maxLineWidth, currentX - spacing)
+                currentX = 0
+                currentY += currentLineHeight + lineSpacing
+                currentLineHeight = 0
+            }
+
+            currentLineHeight = max(currentLineHeight, size.height)
+            currentX += size.width + spacing
+        }
+
+        maxLineWidth = max(maxLineWidth, max(0, currentX - spacing))
+        return CGSize(width: maxLineWidth, height: currentY + currentLineHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var currentX = bounds.minX
+        var currentY = bounds.minY
+        var currentLineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > bounds.maxX, currentX > bounds.minX {
+                currentX = bounds.minX
+                currentY += currentLineHeight + lineSpacing
+                currentLineHeight = 0
+            }
+
+            subview.place(
+                at: CGPoint(x: currentX, y: currentY),
+                proposal: ProposedViewSize(width: size.width, height: size.height)
+            )
+
+            currentX += size.width + spacing
+            currentLineHeight = max(currentLineHeight, size.height)
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: CodexProfilesViewModel
+    let resolvedColorScheme: ColorScheme
     var embedded = false
     var onClose: (() -> Void)?
     @AppStorage(Preferences.showIDsKey) private var showIDs = false
@@ -1821,14 +2686,9 @@ struct SettingsView: View {
     @AppStorage(Preferences.accentRedKey) private var accentRed = 0.15
     @AppStorage(Preferences.accentGreenKey) private var accentGreen = 0.44
     @AppStorage(Preferences.accentBlueKey) private var accentBlue = 0.95
-    @Environment(\.colorScheme) private var systemColorScheme
-
-    private var effectiveColorScheme: ColorScheme {
-        (PanelTheme(rawValue: panelTheme) ?? .system).resolvedColorScheme(using: systemColorScheme)
-    }
 
     private var palette: PanelPalette {
-        PanelPalette.resolve(for: effectiveColorScheme, accent: Color(red: accentRed, green: accentGreen, blue: accentBlue))
+        PanelPalette.resolve(for: resolvedColorScheme, accent: Color(red: accentRed, green: accentGreen, blue: accentBlue))
     }
 
     private var currentAppVersionText: String {
@@ -1891,7 +2751,7 @@ struct SettingsView: View {
                 .padding(24)
             }
         }
-        .environment(\.colorScheme, effectiveColorScheme)
+        .environment(\.colorScheme, resolvedColorScheme)
     }
 
     private var settingsHeader: some View {

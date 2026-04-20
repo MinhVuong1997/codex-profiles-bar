@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="CodexProfilesBar"
 APP_IDENTIFIER="${APP_IDENTIFIER:-com.codexprofiles.bar}"
-APP_VERSION="${APP_VERSION:-1.0.2}"
+APP_VERSION="${APP_VERSION:-1.0.3}"
 APP_BUILD="${APP_BUILD:-$(date +%Y%m%d%H%M%S)}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"

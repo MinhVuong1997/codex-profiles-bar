@@ -15,6 +15,7 @@ enum Preferences {
     static let accentRedKey = "CodexProfilesBar.accentRed"
     static let accentGreenKey = "CodexProfilesBar.accentGreen"
     static let accentBlueKey = "CodexProfilesBar.accentBlue"
+    static let notificationInboxKey = "CodexProfilesBar.notificationInbox"
 }
 
 enum ProfileFilter: String, CaseIterable, Identifiable {
@@ -447,6 +448,59 @@ struct BannerMessage: Identifiable, Equatable {
     let tone: Tone
     let title: String
     let body: String
+}
+
+enum NotificationInboxTone: String, Codable {
+    case info
+    case success
+    case warning
+    case error
+}
+
+enum NotificationInboxActionKind: String, Codable {
+    case reopenCodex
+    case switchToProfile
+}
+
+struct NotificationInboxItem: Identifiable, Codable, Hashable {
+    let id: UUID
+    let createdAt: Date
+    let tone: NotificationInboxTone
+    let title: String
+    let body: String
+    let actionKind: NotificationInboxActionKind?
+    let actionLabel: String?
+    let targetProfileID: String?
+    var isUnread: Bool
+
+    init(
+        id: UUID = UUID(),
+        createdAt: Date = .now,
+        tone: NotificationInboxTone,
+        title: String,
+        body: String,
+        actionKind: NotificationInboxActionKind? = nil,
+        actionLabel: String? = nil,
+        targetProfileID: String? = nil,
+        isUnread: Bool = true
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.tone = tone
+        self.title = title
+        self.body = body
+        self.actionKind = actionKind
+        self.actionLabel = actionLabel
+        self.targetProfileID = targetProfileID
+        self.isUnread = isUnread
+    }
+}
+
+struct ProfileSwitchRecommendation: Equatable {
+    let profileID: String
+    let profileName: String
+    let usagePercent: Int
+    let reason: String
 }
 
 struct CodexRelaunchPrompt: Identifiable, Equatable {
