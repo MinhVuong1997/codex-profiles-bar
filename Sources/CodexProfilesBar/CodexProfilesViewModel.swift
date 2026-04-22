@@ -37,6 +37,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     @Published private(set) var availableAppUpdate: AppUpdateRelease?
     @Published private(set) var notificationInboxItems: [NotificationInboxItem] = []
     @Published private(set) var recommendedSwitch: ProfileSwitchRecommendation?
+    @Published private(set) var activeImportPreview: PendingImportPreview?
     @Published var banner: BannerMessage?
 
     private let service = CodexProfilesService.shared
@@ -410,13 +411,47 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     }
 
     @discardableResult
+    func previewImportBundle(from source: URL) async -> ImportPreviewPayload? {
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            return try await service.previewImport(from: source)
+        } catch {
+            showBanner(title: "Import preview failed", body: error.localizedDescription, tone: .error)
+            return nil
+        }
+    }
+
+    func presentImportPreview(sourceURL: URL, payload: ImportPreviewPayload) {
+        activeImportPreview = PendingImportPreview(sourceURL: sourceURL, payload: payload)
+    }
+
+    func dismissImportPreview() {
+        activeImportPreview = nil
+    }
+
+    @discardableResult
     func importBundle(from source: URL) async -> Bool {
         isLoading = true
         defer { isLoading = false }
 
         do {
-            _ = try await self.service.importProfiles(from: source)
-            showBanner(title: "Import complete", body: "Profiles from \(source.lastPathComponent) are now available.", tone: .success)
+            let importPreviewSnapshot = activeImportPreview
+            let payload = try await self.service.importProfiles(from: source)
+            let descriptor = payload.count == 1 ? "1 profile" : "\(payload.count) profiles"
+            let bannerBody = "Imported \(descriptor) from \(source.lastPathComponent)."
+            showBanner(title: "Import complete", body: bannerBody, tone: .success)
+            await scheduleNotification(
+                identifier: "import-complete-\(UUID().uuidString)",
+                title: "Codex profiles imported",
+                body: importNotificationBody(
+                    descriptor: descriptor,
+                    sourceFilename: source.lastPathComponent,
+                    preview: importPreviewSnapshot
+                ),
+                inboxTone: .success
+            )
             await refresh(trigger: .mutation)
             return true
         } catch {
@@ -1211,6 +1246,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         content.title = title
         content.body = body
         content.sound = .default
+        content.interruptionLevel = .active
         if let categoryIdentifier {
             content.categoryIdentifier = categoryIdentifier
         }
@@ -1222,6 +1258,24 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         )
 
         try? await notificationCenter.add(request)
+    }
+
+    private func importNotificationBody(
+        descriptor: String,
+        sourceFilename: String,
+        preview: PendingImportPreview?
+    ) -> String {
+        guard let preview else {
+            return "Imported \(descriptor) from \(sourceFilename)."
+        }
+
+        let skippedCount = preview.payload.skippedCount
+        guard skippedCount > 0 else {
+            return "Imported \(descriptor) from \(sourceFilename)."
+        }
+
+        let skippedDescriptor = skippedCount == 1 ? "1 item was skipped" : "\(skippedCount) items were skipped"
+        return "Imported \(descriptor) from \(sourceFilename). \(skippedDescriptor)."
     }
 
     private func enrichDoctorReport(_ report: DoctorReport) async -> DoctorReport {

@@ -432,6 +432,87 @@ struct ImportPayload: Decodable {
     }
 }
 
+enum ImportPreviewDisposition: String, Codable, Hashable {
+    case ready
+    case existing
+    case duplicate
+    case conflict
+    case invalid
+}
+
+struct ImportPreviewProfilePayload: Identifiable, Codable, Hashable {
+    let id: String
+    let label: String?
+    let email: String?
+    let plan: String?
+    let disposition: ImportPreviewDisposition
+    let reason: String?
+
+    init(
+        id: String,
+        label: String?,
+        email: String?,
+        plan: String?,
+        disposition: ImportPreviewDisposition,
+        reason: String?
+    ) {
+        self.id = id
+        self.label = label
+        self.email = email
+        self.plan = plan
+        self.disposition = disposition
+        self.reason = reason
+    }
+
+    var primaryText: String {
+        label ?? email ?? id
+    }
+
+    var secondaryText: String {
+        let trimmedEmail = email?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmedEmail, !trimmedEmail.isEmpty else { return "" }
+        return trimmedEmail == primaryText ? "" : trimmedEmail
+    }
+}
+
+struct ImportPreviewPayload: Codable, Hashable {
+    let totalCount: Int
+    let importableCount: Int
+    let existingCount: Int
+    let duplicateCount: Int
+    let conflictCount: Int
+    let invalidCount: Int
+    let profiles: [ImportPreviewProfilePayload]
+
+    init(
+        totalCount: Int,
+        importableCount: Int,
+        existingCount: Int,
+        duplicateCount: Int,
+        conflictCount: Int,
+        invalidCount: Int,
+        profiles: [ImportPreviewProfilePayload]
+    ) {
+        self.totalCount = totalCount
+        self.importableCount = importableCount
+        self.existingCount = existingCount
+        self.duplicateCount = duplicateCount
+        self.conflictCount = conflictCount
+        self.invalidCount = invalidCount
+        self.profiles = profiles
+    }
+
+    var skippedCount: Int {
+        totalCount - importableCount
+    }
+}
+
+struct PendingImportPreview: Identifiable, Hashable {
+    let id = UUID()
+    let sourceURL: URL
+    let payload: ImportPreviewPayload
+}
+
 struct DeletePayload: Decodable {
     let count: Int
 }

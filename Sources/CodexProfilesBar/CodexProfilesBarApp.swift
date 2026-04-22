@@ -66,6 +66,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         NotificationCenter.default.post(name: .reopenCodexFromNotification, object: nil)
     }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.list, .banner, .sound])
+    }
 }
 
 @main
@@ -116,6 +124,13 @@ struct CodexProfilesBarApp: App {
                 .background(DetachedPanelWindowConfigurator(appearance: resolvedAppearance))
         }
         .windowResizability(.contentMinSize)
+
+        Window("Import Preview", id: "import-preview") {
+            ImportPreviewWindowView(model: model, resolvedColorScheme: resolvedColorScheme)
+                .preferredColorScheme(resolvedColorScheme)
+                .background(UtilityWindowConfigurator(identifier: "import-preview", appearance: resolvedAppearance))
+        }
+        .windowResizability(.contentSize)
     }
 }
 
@@ -242,5 +257,35 @@ private struct DetachedPanelWindowConfigurator: NSViewRepresentable {
                 window.makeKeyAndOrderFront(nil)
             }
         }
+    }
+}
+
+private struct UtilityWindowConfigurator: NSViewRepresentable {
+    let identifier: String
+    let appearance: NSAppearance?
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            configureWindow(for: view)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            configureWindow(for: nsView)
+        }
+    }
+
+    private func configureWindow(for view: NSView) {
+        guard let window = view.window else { return }
+        window.identifier = NSUserInterfaceItemIdentifier(identifier)
+        window.level = .normal
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        window.collectionBehavior.insert(.fullScreenAuxiliary)
+        window.appearance = appearance
+        window.isReleasedWhenClosed = false
+        window.center()
     }
 }

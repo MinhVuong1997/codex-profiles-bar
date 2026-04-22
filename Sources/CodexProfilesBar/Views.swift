@@ -15,7 +15,6 @@ struct MenuBarRootView: View {
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
 
-    @State private var showImportPicker = false
     @State private var showSaveSheet = false
     @State private var showDoctorSheet = false
     @State private var showInboxSheet = false
@@ -31,7 +30,7 @@ struct MenuBarRootView: View {
     @State private var deleteTarget: ProfileStatus?
     @State private var bulkDeleteTargets: [ProfileStatus] = []
     @State private var switchTarget: ProfileStatus?
-    @State private var isImporting = false
+    @State private var isPreparingImportPreview = false
     @State private var isExportingAll = false
     @State private var clearingLabelProfileID: String?
     @State private var localKeyMonitor: Any?
@@ -245,30 +244,6 @@ struct MenuBarRootView: View {
             }
             requestTopScroll()
         }
-        .fileImporter(
-            isPresented: $showImportPicker,
-            allowedContentTypes: [.json],
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                isImporting = true
-                Task {
-                    _ = await model.importBundle(from: url)
-                    await MainActor.run {
-                        isImporting = false
-                    }
-                }
-            case .failure(let error):
-                isImporting = false
-                model.banner = BannerMessage(
-                    tone: .error,
-                    title: "Import cancelled",
-                    body: error.localizedDescription
-                )
-            }
-        }
     }
 
     private var activeOverlayKind: String? {
@@ -388,10 +363,24 @@ struct MenuBarRootView: View {
                 }
                 .disabled(model.isLoading)
 
-                ActionButton(title: isImporting ? "Importing…" : "Import", symbol: "square.and.arrow.down.on.square", isLoading: isImporting) {
-                    showImportPicker = true
+                ActionButton(
+                    title: isPreparingImportPreview ? "Previewing…" : "Import",
+                    symbol: "square.and.arrow.down.on.square",
+                    isLoading: isPreparingImportPreview
+                ) {
+                    guard let url = presentImportPanel() else { return }
+                    isPreparingImportPreview = true
+                    Task {
+                        let preview = await model.previewImportBundle(from: url)
+                        await MainActor.run {
+                            isPreparingImportPreview = false
+                            guard let preview else { return }
+                            model.presentImportPreview(sourceURL: url, payload: preview)
+                            openImportPreviewWindow()
+                        }
+                    }
                 }
-                .disabled(model.isLoading || isImporting || isExportingAll)
+                .disabled(model.isLoading || isPreparingImportPreview || isExportingAll)
 
                 ActionButton(title: isExportingAll ? "Exporting…" : "Export All", symbol: "square.and.arrow.up", isLoading: isExportingAll) {
                     Task {
@@ -406,7 +395,7 @@ struct MenuBarRootView: View {
                         }
                     }
                 }
-                .disabled(model.savedProfiles.isEmpty || model.isLoading || isImporting || isExportingAll)
+                .disabled(model.savedProfiles.isEmpty || model.isLoading || isPreparingImportPreview || isExportingAll)
 
                 ActionButton(title: "Doctor", symbol: "stethoscope") {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
@@ -414,7 +403,7 @@ struct MenuBarRootView: View {
                     }
                     Task { await model.loadDoctorReport() }
                 }
-                .disabled(model.isLoading || isImporting || isExportingAll)
+                .disabled(model.isLoading || isPreparingImportPreview || isExportingAll)
             }
 
             HStack(spacing: 10) {
@@ -681,6 +670,19 @@ struct MenuBarRootView: View {
         return panel.runModal() == .OK ? panel.url : nil
     }
 
+    private func presentImportPanel() -> URL? {
+        resignTextInputFocus()
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Preview Import"
+        panel.message = "Choose an exported Codex profile bundle to preview before importing."
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
     private func openSettingsWindow() {
         resignTextInputFocus()
         NSApp.activate(ignoringOtherApps: true)
@@ -731,6 +733,33 @@ struct MenuBarRootView: View {
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(80))
             focusPanel()
+        }
+    }
+
+    private func openImportPreviewWindow() {
+        resignTextInputFocus()
+        let existingWindows = Set(NSApp.windows.map(ObjectIdentifier.init))
+        openWindow(id: "import-preview")
+        NSApp.activate(ignoringOtherApps: true)
+
+        @MainActor
+        func focusWindow() {
+            let previewWindow = NSApp.windows.first(where: { window in
+                window.identifier?.rawValue == "import-preview"
+                    || window.title.localizedCaseInsensitiveContains("import preview")
+                    || !existingWindows.contains(ObjectIdentifier(window))
+            })
+            previewWindow?.level = .normal
+            previewWindow?.makeMain()
+            previewWindow?.makeKeyAndOrderFront(nil)
+        }
+
+        Task { @MainActor in
+            focusWindow()
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(80))
+            focusWindow()
         }
     }
 
@@ -2020,6 +2049,322 @@ struct SaveProfileOverlay: View {
                 .animation(.easeInOut(duration: 0.18), value: isSaving)
             }
             .frame(width: 344)
+        }
+    }
+}
+
+struct ImportPreviewWindowView: View {
+    @ObservedObject var model: CodexProfilesViewModel
+    let resolvedColorScheme: ColorScheme
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var palette: PanelPalette {
+        PanelPalette.resolve(for: colorScheme)
+    }
+
+    private var preview: PendingImportPreview? {
+        model.activeImportPreview
+    }
+
+    private var orderedProfiles: [ImportPreviewProfilePayload] {
+        guard let preview else { return [] }
+        return preview.payload.profiles.sorted { lhs, rhs in
+            if dispositionRank(lhs.disposition) != dispositionRank(rhs.disposition) {
+                return dispositionRank(lhs.disposition) < dispositionRank(rhs.disposition)
+            }
+            return lhs.primaryText.localizedCaseInsensitiveCompare(rhs.primaryText) == .orderedAscending
+        }
+    }
+
+    var body: some View {
+        Group {
+            if let preview {
+                ZStack {
+                    LinearGradient(
+                        colors: [palette.backgroundStart, palette.backgroundEnd],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .ignoresSafeArea()
+
+                    VStack(alignment: .leading, spacing: 16) {
+                        FlowLayout(spacing: 8, lineSpacing: 8) {
+                            ImportPreviewSummaryPill(
+                                title: "Ready",
+                                value: preview.payload.importableCount,
+                                tint: palette.success
+                            )
+                            ImportPreviewSummaryPill(
+                                title: "Already saved",
+                                value: preview.payload.existingCount,
+                                tint: palette.warning
+                            )
+                            ImportPreviewSummaryPill(
+                                title: "Duplicates",
+                                value: preview.payload.duplicateCount,
+                                tint: palette.warning
+                            )
+                            ImportPreviewSummaryPill(
+                                title: "Needs review",
+                                value: preview.payload.conflictCount + preview.payload.invalidCount,
+                                tint: palette.danger
+                            )
+                        }
+
+                        Group {
+                            if preview.payload.totalCount == 0 {
+                                Text("No profiles were found in this file.")
+                                    .font(.system(.callout, design: .rounded))
+                                    .foregroundStyle(palette.secondaryText)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(14)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                            .fill(palette.subtleFill)
+                                    )
+                            } else {
+                                ScrollView {
+                                    VStack(spacing: 10) {
+                                        ForEach(orderedProfiles) { item in
+                                            ImportPreviewRow(item: item, palette: palette)
+                                        }
+                                    }
+                                    .padding(.trailing, 4)
+                                }
+                                .frame(maxHeight: .infinity)
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 12) {
+                            if preview.payload.skippedCount > 0 {
+                                Text("Only profiles marked Ready will be imported. Existing or invalid entries stay untouched.")
+                                    .font(.system(.caption, design: .rounded, weight: .medium))
+                                    .foregroundStyle(palette.secondaryText)
+                            }
+
+                            HStack {
+                                Button("Cancel") {
+                                    closeWindow()
+                                }
+                                .disabled(model.isLoading)
+
+                                Spacer()
+
+                                Button(action: {
+                                    Task {
+                                        let didImport = await model.importBundle(from: preview.sourceURL)
+                                        await MainActor.run {
+                                            if didImport {
+                                                closeWindow()
+                                            }
+                                        }
+                                    }
+                                }) {
+                                    HStack(spacing: 8) {
+                                        if model.isLoading {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        }
+                                        Text(model.isLoading ? "Importing…" : importButtonTitle(preview))
+                                    }
+                                }
+                                .keyboardShortcut(.defaultAction)
+                                .disabled(model.isLoading || preview.payload.importableCount == 0)
+                            }
+                            .animation(.easeInOut(duration: 0.18), value: model.isLoading)
+                        }
+                        .padding(.top, 4)
+                        .padding(.horizontal, 2)
+                        .padding(.bottom, 2)
+                        .background(
+                            LinearGradient(
+                                colors: [
+                                    palette.backgroundEnd.opacity(0.02),
+                                    palette.backgroundEnd.opacity(0.94)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                    }
+                    .padding(18)
+                }
+                .preferredColorScheme(resolvedColorScheme)
+                .frame(minWidth: 500, idealWidth: 540, maxWidth: 620, minHeight: 420, idealHeight: 560, maxHeight: 700)
+            } else {
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .onAppear {
+                        dismiss()
+                    }
+            }
+        }
+        .onDisappear {
+            if model.activeImportPreview != nil {
+                model.dismissImportPreview()
+            }
+        }
+    }
+
+    private func importButtonTitle(_ preview: PendingImportPreview) -> String {
+        let count = preview.payload.importableCount
+        return count == 1 ? "Import 1 Profile" : "Import \(count) Profiles"
+    }
+
+    private func dispositionRank(_ disposition: ImportPreviewDisposition) -> Int {
+        switch disposition {
+        case .ready:
+            0
+        case .existing:
+            1
+        case .duplicate:
+            2
+        case .conflict:
+            3
+        case .invalid:
+            4
+        }
+    }
+
+    private func closeWindow() {
+        model.dismissImportPreview()
+        dismiss()
+    }
+}
+
+struct ImportPreviewSummaryPill: View {
+    let title: String
+    let value: Int
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("\(value)")
+                .font(.system(.caption, design: .rounded, weight: .bold))
+                .foregroundStyle(tint)
+            Text(title)
+                .font(.system(.caption, design: .rounded, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(tint.opacity(0.12), in: Capsule())
+    }
+}
+
+struct ImportPreviewRow: View {
+    let item: ImportPreviewProfilePayload
+    let palette: PanelPalette
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Circle()
+                    .fill(tint.opacity(0.16))
+                    .frame(width: 32, height: 32)
+                    .overlay(
+                        Image(systemName: symbol)
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(tint)
+                    )
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(item.primaryText)
+                            .font(.system(.subheadline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        if let plan = item.plan, !plan.isEmpty {
+                            Text(plan.capitalized)
+                                .font(.system(.caption2, design: .monospaced, weight: .medium))
+                                .foregroundStyle(tint)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(tint.opacity(0.12), in: Capsule())
+                        }
+                    }
+
+                    if !item.secondaryText.isEmpty {
+                        Text(item.secondaryText)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text(item.id)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
+
+                Text(statusTitle)
+                    .font(.system(.caption2, design: .rounded, weight: .bold))
+                    .foregroundStyle(tint)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(tint.opacity(0.14), in: Capsule())
+            }
+
+            if let reason = item.reason, !reason.isEmpty {
+                Text(reason)
+                    .font(.system(.caption, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(palette.subtleFill)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(palette.cardStroke, lineWidth: 1)
+                )
+        )
+    }
+
+    private var tint: Color {
+        switch item.disposition {
+        case .ready:
+            palette.success
+        case .existing, .duplicate:
+            palette.warning
+        case .conflict, .invalid:
+            palette.danger
+        }
+    }
+
+    private var symbol: String {
+        switch item.disposition {
+        case .ready:
+            "checkmark.circle.fill"
+        case .existing:
+            "externaldrive.badge.checkmark"
+        case .duplicate:
+            "square.stack.3d.down.right.fill"
+        case .conflict:
+            "tag.slash.fill"
+        case .invalid:
+            "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var statusTitle: String {
+        switch item.disposition {
+        case .ready:
+            "Ready"
+        case .existing:
+            "Skip"
+        case .duplicate:
+            "Duplicate"
+        case .conflict:
+            "Conflict"
+        case .invalid:
+            "Invalid"
         }
     }
 }

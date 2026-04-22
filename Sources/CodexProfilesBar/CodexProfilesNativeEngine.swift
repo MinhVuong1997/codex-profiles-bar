@@ -191,36 +191,31 @@ actor CodexProfilesNativeEngine {
         return payload
     }
 
+    func previewImport(from source: URL) async throws -> ImportPreviewPayload {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+
+        let bundle = try loadImportBundle(from: source)
+        return try withProfilesLock(paths) {
+            let store = try loadStore(paths: paths)
+            let existingIDs = try collectProfileIDs(in: paths.profiles)
+            return try analyzeImport(bundle: bundle, store: store, existingIDs: existingIDs).preview
+        }
+    }
+
     func importProfiles(from source: URL) async throws -> ImportPayload {
         let paths = try resolvePaths()
         try ensurePaths(paths)
 
-        let data = try Data(contentsOf: source)
-        let bundle = try JSONDecoder().decode(NativeExportBundle.self, from: data)
-        guard bundle.version == 1 else {
-            throw CodexProfilesError.commandFailed("Import file version \(bundle.version) is not supported.")
-        }
+        let bundle = try loadImportBundle(from: source)
 
         return try withProfilesLock(paths) {
             var store = try loadStore(paths: paths)
             let existingIDs = try collectProfileIDs(in: paths.profiles)
-
-            var stagedLabels = store.labels
-            var seen = Set<String>()
-            var prepared = [PreparedImportProfile]()
-
-            for profile in bundle.profiles {
-                try validateImportProfileID(profile.id)
-                guard seen.insert(profile.id).inserted else {
-                    throw CodexProfilesError.commandFailed("Import bundle contains duplicate profile id `\(profile.id)`.")
-                }
-                guard !existingIDs.contains(profile.id) else {
-                    throw CodexProfilesError.commandFailed("Saved profile `\(profile.id)` already exists.")
-                }
-                if let label = profile.label {
-                    try assignLabel(&stagedLabels, label: label, id: profile.id)
-                }
-                prepared.append(try prepareImportProfile(profile))
+            let analysis = try analyzeImport(bundle: bundle, store: store, existingIDs: existingIDs)
+            let prepared = analysis.prepared
+            guard !prepared.isEmpty else {
+                throw CodexProfilesError.commandFailed("No new profiles are available to import from this file.")
             }
 
             var writtenIDs = [String]()
@@ -237,10 +232,8 @@ actor CodexProfilesNativeEngine {
                 throw error
             }
 
+            store.labels = analysis.labels
             for profile in prepared {
-                if let label = profile.label {
-                    try assignLabel(&store.labels, label: label, id: profile.id)
-                }
                 updateIndexEntry(&store.index, id: profile.id, tokens: profile.tokens, label: profile.label)
             }
             try saveStore(store, paths: paths)
@@ -248,6 +241,154 @@ actor CodexProfilesNativeEngine {
             let imported = prepared.map { ImportedProfilePayload(id: $0.id, label: $0.label) }
             return ImportPayload(count: imported.count, profiles: imported)
         }
+    }
+
+    private func loadImportBundle(from source: URL) throws -> NativeExportBundle {
+        let hasSecurityScope = source.startAccessingSecurityScopedResource()
+        defer {
+            if hasSecurityScope {
+                source.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let data = try Data(contentsOf: source)
+        let bundle = try JSONDecoder().decode(NativeExportBundle.self, from: data)
+        guard bundle.version == 1 else {
+            throw CodexProfilesError.commandFailed("Import file version \(bundle.version) is not supported.")
+        }
+        return bundle
+    }
+
+    private func analyzeImport(bundle: NativeExportBundle, store: NativeStore, existingIDs: Set<String>) throws -> ImportAnalysis {
+        var stagedLabels = store.labels
+        var seen = Set<String>()
+        var prepared = [PreparedImportProfile]()
+        var previewProfiles = [ImportPreviewProfilePayload]()
+        var existingCount = 0
+        var duplicateCount = 0
+        var conflictCount = 0
+        var invalidCount = 0
+
+        for profile in bundle.profiles {
+            let trimmedLabel = profile.label?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            guard seen.insert(profile.id).inserted else {
+                duplicateCount += 1
+                previewProfiles.append(
+                    ImportPreviewProfilePayload(
+                        id: profile.id,
+                        label: trimmedLabel,
+                        email: nil,
+                        plan: nil,
+                        disposition: .duplicate,
+                        reason: "Duplicate profile id in the selected file."
+                    )
+                )
+                continue
+            }
+
+            do {
+                try validateImportProfileID(profile.id)
+            } catch {
+                invalidCount += 1
+                previewProfiles.append(
+                    ImportPreviewProfilePayload(
+                        id: profile.id,
+                        label: trimmedLabel,
+                        email: nil,
+                        plan: nil,
+                        disposition: .invalid,
+                        reason: error.localizedDescription
+                    )
+                )
+                continue
+            }
+
+            guard !existingIDs.contains(profile.id) else {
+                existingCount += 1
+                previewProfiles.append(
+                    ImportPreviewProfilePayload(
+                        id: profile.id,
+                        label: trimmedLabel,
+                        email: nil,
+                        plan: nil,
+                        disposition: .existing,
+                        reason: "This profile is already saved locally."
+                    )
+                )
+                continue
+            }
+
+            let preparedProfile: PreparedImportProfile
+            do {
+                preparedProfile = try prepareImportProfile(profile)
+            } catch {
+                invalidCount += 1
+                previewProfiles.append(
+                    ImportPreviewProfilePayload(
+                        id: profile.id,
+                        label: trimmedLabel,
+                        email: nil,
+                        plan: nil,
+                        disposition: .invalid,
+                        reason: error.localizedDescription
+                    )
+                )
+                continue
+            }
+
+            let (email, plan) = extractEmailAndPlan(from: preparedProfile.tokens)
+            if let label = preparedProfile.label, !label.isEmpty {
+                do {
+                    try assignLabel(&stagedLabels, label: label, id: preparedProfile.id)
+                } catch {
+                    let message = error.localizedDescription
+                    let isConflict = message.localizedCaseInsensitiveContains("already assigned")
+                    if isConflict {
+                        conflictCount += 1
+                    } else {
+                        invalidCount += 1
+                    }
+                    previewProfiles.append(
+                        ImportPreviewProfilePayload(
+                            id: preparedProfile.id,
+                            label: preparedProfile.label,
+                            email: email,
+                            plan: plan,
+                            disposition: isConflict ? .conflict : .invalid,
+                            reason: message
+                        )
+                    )
+                    continue
+                }
+            }
+
+            prepared.append(preparedProfile)
+            previewProfiles.append(
+                ImportPreviewProfilePayload(
+                    id: preparedProfile.id,
+                    label: preparedProfile.label,
+                    email: email,
+                    plan: plan,
+                    disposition: .ready,
+                    reason: nil
+                )
+            )
+        }
+
+        return ImportAnalysis(
+            prepared: prepared,
+            labels: stagedLabels,
+            preview: ImportPreviewPayload(
+                totalCount: bundle.profiles.count,
+                importableCount: prepared.count,
+                existingCount: existingCount,
+                duplicateCount: duplicateCount,
+                conflictCount: conflictCount,
+                invalidCount: invalidCount,
+                profiles: previewProfiles
+            )
+        )
     }
 
     func deleteProfile(id: String) async throws {
@@ -407,6 +548,12 @@ private extension CodexProfilesNativeEngine {
         let label: String?
         let contents: Data
         let tokens: NativeTokens
+    }
+
+    struct ImportAnalysis {
+        let prepared: [PreparedImportProfile]
+        let labels: [String: String]
+        let preview: ImportPreviewPayload
     }
 
     enum TokenLoadResult {

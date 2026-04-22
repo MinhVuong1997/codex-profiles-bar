@@ -39,6 +39,10 @@ actor CodexProfilesService {
         try await engine.exportProfiles(ids: ids, to: destination)
     }
 
+    func previewImport(from source: URL) async throws -> ImportPreviewPayload {
+        try await engine.previewImport(from: source)
+    }
+
     func importProfiles(from source: URL) async throws -> ImportPayload {
         try await engine.importProfiles(from: source)
     }
