@@ -38,6 +38,11 @@ struct MenuBarRootView: View {
     @State private var pendingCenteredScrollProfileID: String?
     @State private var pendingTopScrollRequest = 0
     @State private var isTopScrollPending = false
+    @State private var selectedMainTab: MainPanelTab = .profiles
+    @State private var modelProxyPortText = "\(ModelProxyState.defaultPort)"
+    @State private var modelProxyUpstreamText = ModelProxyState.defaultUpstreamBaseURL
+    @State private var modelContextWindowText = ""
+    @State private var modelTokenLimitPercentText = ""
     private let scrollTopAnchorID = "profiles-scroll-top"
 
     private var palette: PanelPalette {
@@ -159,17 +164,6 @@ struct MenuBarRootView: View {
                 .zIndex(2)
             }
 
-            if let prompt = model.codexRelaunchPrompt {
-                CodexRelaunchOverlay(model: model, prompt: prompt) {
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
-                        model.dismissCodexRelaunchPrompt()
-                    }
-                }
-                .padding(14)
-                .transition(.scale(scale: 0.96).combined(with: .opacity))
-                .zIndex(2)
-            }
-
             if showQuickSwitch {
                 QuickSwitchOverlay(
                     query: $quickSwitchQuery,
@@ -213,6 +207,7 @@ struct MenuBarRootView: View {
             installLocalMouseMonitorIfNeeded()
             ensureValidSelection()
             requestTopScroll()
+            loadModelProxySettingsDraft()
         }
         .onDisappear {
             removeLocalKeyMonitor()
@@ -224,6 +219,16 @@ struct MenuBarRootView: View {
         }
         .onChange(of: model.profiles.map(\.stableID)) { _, _ in
             ensureValidSelection()
+        }
+        .onChange(of: model.modelProxyRuntimeModel) { _, _ in
+            if selectedMainTab == .proxy {
+                loadModelProxySettingsDraft()
+            }
+        }
+        .onChange(of: selectedMainTab) { _, nextTab in
+            if nextTab == .proxy {
+                loadModelProxySettingsDraft()
+            }
         }
         .onChange(of: quickSwitchResults.map(\.stableID)) { _, ids in
             if ids.isEmpty {
@@ -255,7 +260,6 @@ struct MenuBarRootView: View {
         if deleteTarget != nil { return "delete" }
         if !bulkDeleteTargets.isEmpty { return "bulk-delete" }
         if switchTarget != nil { return "switch" }
-        if model.codexRelaunchPrompt != nil { return "relaunch" }
         return nil
     }
 
@@ -269,8 +273,6 @@ struct MenuBarRootView: View {
                 deleteTarget = nil
             } else if labelEditorTarget != nil {
                 labelEditorTarget = nil
-            } else if model.codexRelaunchPrompt != nil {
-                model.dismissCodexRelaunchPrompt()
             } else if showQuickSwitch {
                 showQuickSwitch = false
             } else if showSaveSheet {
@@ -291,18 +293,18 @@ struct MenuBarRootView: View {
                         .font(.system(.title3, design: .rounded, weight: .bold))
                         .foregroundStyle(palette.primaryText)
 
-                    RefreshActivityBadge(isRefreshing: model.isRefreshingProfiles)
+                    RefreshActivityBadge(isRefreshing: model.isRefreshButtonLoading)
                 }
             }
 
             Spacer()
 
             HStack(spacing: 8) {
-                RefreshButton(isRefreshing: model.isRefreshingProfiles) {
-                    Task { await model.refresh() }
+                RefreshButton(isRefreshing: model.isRefreshButtonLoading) {
+                    Task { await model.refreshFromUserAction() }
                 }
-                .disabled(model.isRefreshingProfiles)
-                .help(model.isRefreshingProfiles ? "Refreshing profiles…" : "Refresh profiles")
+                .disabled(model.isRefreshButtonLoading)
+                .help(model.isRefreshButtonLoading ? "Refreshing profiles…" : "Refresh profiles")
 
                 Button {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
@@ -351,6 +353,7 @@ struct MenuBarRootView: View {
                 }
                 .buttonStyle(IconButtonStyle())
                 .help("Exit app")
+
             }
         }
     }
@@ -406,38 +409,71 @@ struct MenuBarRootView: View {
                 .disabled(model.isLoading || isPreparingImportPreview || isExportingAll)
             }
 
-            HStack(spacing: 10) {
-                SearchField(text: $searchText, palette: palette)
-                filterCountBadge
-                Button {
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
-                        bulkSelectionMode.toggle()
+            if selectedMainTab == .profiles {
+                HStack(spacing: 10) {
+                    SearchField(text: $searchText, palette: palette)
+                    filterCountBadge
+                    Button {
+                        withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                            bulkSelectionMode.toggle()
+                        }
+                        if !bulkSelectionMode {
+                            bulkSelectedProfileIDs.removeAll()
+                        }
+                    } label: {
+                        Text(bulkSelectionMode ? "Done" : "Select")
+                            .font(.system(.caption, design: .rounded, weight: .bold))
+                            .foregroundStyle(bulkSelectionMode ? Color.white : palette.primaryText)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(
+                                Capsule()
+                                    .fill(bulkSelectionMode ? palette.accent : palette.subtleFill)
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(bulkSelectionMode ? palette.accent.opacity(0.4) : palette.cardStroke, lineWidth: 1)
+                                    )
+                            )
                     }
-                    if !bulkSelectionMode {
-                        bulkSelectedProfileIDs.removeAll()
-                    }
-                } label: {
-                    Text(bulkSelectionMode ? "Done" : "Select")
-                        .font(.system(.caption, design: .rounded, weight: .bold))
-                        .foregroundStyle(bulkSelectionMode ? Color.white : palette.primaryText)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            Capsule()
-                                .fill(bulkSelectionMode ? palette.accent : palette.subtleFill)
-                                .overlay(
-                                    Capsule()
-                                        .stroke(bulkSelectionMode ? palette.accent.opacity(0.4) : palette.cardStroke, lineWidth: 1)
-                                )
-                        )
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
+            } else {
+                HStack(spacing: 10) {
+                    ProxyStatusBadge(state: model.modelProxyState)
+                    Text(model.modelProxyState.isCodexConfigured ? "Codex is routed through the local provider." : "Codex is not using the local provider.")
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(palette.secondaryText)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(palette.subtleFill)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(palette.cardStroke, lineWidth: 1)
+                        )
+                )
             }
         }
     }
 
     @ViewBuilder
     private var content: some View {
+        VStack(spacing: 0) {
+            mainTabBar
+
+            if selectedMainTab == .profiles {
+                profilesContent
+            } else {
+                proxyContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var profilesContent: some View {
         if model.isLoading && model.profiles.isEmpty {
             Spacer()
             ProgressView("Loading profiles…")
@@ -470,12 +506,8 @@ struct MenuBarRootView: View {
                                     sparklineValues: model.usageHistoryByProfileID[currentProfile.id ?? ""]?.sparklinePercentages ?? [],
                                     healthBadges: healthBadges(for: currentProfile),
                                     recommendation: model.recommendedSwitch,
-                                    isRestartingCodex: model.isRestartingCodex,
                                     onToggleFavorite: {
                                         model.toggleFavorite(currentProfile)
-                                    },
-                                    onReopen: {
-                                        Task { _ = await model.restartCodex() }
                                     },
                                     onSwitchRecommended: {
                                         guard let recommendation = model.recommendedSwitch,
@@ -502,13 +534,13 @@ struct MenuBarRootView: View {
 
                             if let lastRefresh = model.lastRefresh {
                                 HStack {
-                                    Text(model.isRefreshingProfiles ? "Refreshing profiles…" : "Updated \(lastRefresh.formatted(date: .omitted, time: .shortened))")
+                                    Text(model.isRefreshButtonLoading ? "Refreshing profiles…" : "Updated \(lastRefresh.formatted(date: .omitted, time: .shortened))")
                                         .font(.system(.caption, design: .monospaced))
-                                        .foregroundStyle(model.isRefreshingProfiles ? palette.success : palette.tertiaryText)
+                                        .foregroundStyle(model.isRefreshButtonLoading ? palette.success : palette.tertiaryText)
                                         .contentTransition(.opacity)
                                     Spacer()
                                 }
-                            } else if model.isRefreshingProfiles {
+                            } else if model.isRefreshButtonLoading {
                                 HStack {
                                     Text("Refreshing profiles…")
                                         .font(.system(.caption, design: .monospaced))
@@ -658,6 +690,34 @@ struct MenuBarRootView: View {
     private func requestTopScroll() {
         isTopScrollPending = true
         pendingTopScrollRequest += 1
+    }
+
+    private func loadModelProxySettingsDraft() {
+        let storedPort = UserDefaults.standard.integer(forKey: Preferences.modelProxyPortKey)
+        let port = (1...65_535).contains(storedPort) ? storedPort : ModelProxyState.defaultPort
+        modelProxyPortText = "\(port)"
+        let upstream = UserDefaults.standard.string(forKey: Preferences.modelProxyUpstreamKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let upstream, !upstream.isEmpty, upstream.caseInsensitiveCompare("https://api.openai.com/v1") != .orderedSame {
+            modelProxyUpstreamText = upstream
+        } else {
+            modelProxyUpstreamText = ModelProxyState.defaultUpstreamBaseURL
+        }
+
+        if let contextWindow = model.modelProxyRuntimeModel.contextWindow {
+            modelContextWindowText = "\(contextWindow)"
+        } else {
+            modelContextWindowText = ""
+        }
+
+        if let contextWindow = model.modelProxyRuntimeModel.contextWindow,
+           let tokenLimit = model.modelProxyRuntimeModel.autoCompactTokenLimit,
+           contextWindow > 0 {
+            let percent = Int((Double(tokenLimit) / Double(contextWindow) * 100.0).rounded())
+            modelTokenLimitPercentText = "\(max(1, min(percent, 100)))"
+        } else {
+            modelTokenLimitPercentText = ""
+        }
     }
 
     private func presentSavePanel(suggestedName: String) -> URL? {
@@ -1160,6 +1220,81 @@ struct MenuBarRootView: View {
         .animation(.spring(response: 0.3, dampingFraction: 0.84), value: selectedFilter)
     }
 
+    private var mainTabBar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                ForEach(MainPanelTab.allCases) { tab in
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            selectedMainTab = tab
+                        }
+                        if tab == .profiles {
+                            requestTopScroll()
+                        } else if tab == .proxy {
+                            loadModelProxySettingsDraft()
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: tab.symbol)
+                                .font(.system(size: 12, weight: .bold))
+                            Text(tab.title)
+                                .font(.system(.caption, design: .rounded, weight: .bold))
+                        }
+                        .foregroundStyle(selectedMainTab == tab ? Color.white : palette.secondaryText)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .frame(minWidth: 90)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(
+                                    selectedMainTab == tab
+                                        ? LinearGradient(
+                                            colors: [palette.accent, palette.accentSecondary],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                        : LinearGradient(
+                                            colors: [palette.subtleFill, palette.subtleFill.opacity(0.72)],
+                                            startPoint: .top,
+                                            endPoint: .bottom
+                                        )
+                                )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(selectedMainTab == tab ? palette.cardStroke.opacity(1.4) : palette.cardStroke, lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .scaleEffect(selectedMainTab == tab ? 1.0 : 0.985)
+                }
+            }
+            .padding(6)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(palette.chipFill)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(palette.chipStroke, lineWidth: 1)
+                    )
+            )
+
+            Spacer(minLength: 0)
+        }
+        .padding(.bottom, 8)
+        .animation(.spring(response: 0.3, dampingFraction: 0.84), value: selectedMainTab)
+    }
+
+    private var proxyContent: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                proxyDashboardCard
+            }
+            .padding(.bottom, 8)
+        }
+        .scrollIndicators(.hidden)
+    }
+
     private var filterBarHeader: some View {
         filterBar
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1187,6 +1322,211 @@ struct MenuBarRootView: View {
                             .stroke(palette.cardStroke, lineWidth: 1)
                     )
             )
+    }
+
+    private var proxyDashboardCard: some View {
+        SettingsCard(
+            eyebrow: "Proxy",
+            title: "Local Model Proxy",
+            detail: "Custom provider for Codex plus an OpenAI-compatible endpoint for manual clients."
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 14) {
+                    Toggle(
+                        isOn: Binding(
+                            get: { model.modelProxyState.isEnabled },
+                            set: { enabled in
+                                Task { await model.setModelProxyEnabled(enabled) }
+                            }
+                        )
+                    ) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Run local proxy")
+                                .font(.system(.headline, design: .rounded, weight: .semibold))
+                                .foregroundStyle(palette.primaryText)
+                            Text("Use the active saved profile without changing the model name you select in Codex.")
+                                .font(.system(.caption, design: .rounded))
+                                .foregroundStyle(palette.secondaryText)
+                        }
+                    }
+                    .toggleStyle(.switch)
+
+                    Spacer()
+
+                    ProxyStatusBadge(state: model.modelProxyState)
+                }
+
+                LabeledSettingRow(
+                    label: "Codex provider URL",
+                    value: model.modelProxyState.codexBaseURL,
+                    isMonospaced: true
+                )
+
+                LabeledSettingRow(
+                    label: "OpenAI-compatible URL",
+                    value: model.modelProxyState.endpoint,
+                    isMonospaced: true
+                )
+
+                LabeledSettingRow(
+                    label: "Codex routing",
+                    value: model.modelProxyState.isCodexConfigured ? "Custom model_provider points at the local proxy" : "Codex is still using another provider",
+                    isMonospaced: false
+                )
+
+                if let activeProfileName = model.modelProxyState.activeProfileName {
+                    LabeledSettingRow(
+                        label: "Active profile",
+                        value: activeProfileName,
+                        isMonospaced: false
+                    )
+                }
+
+                if let error = model.modelProxyState.lastError {
+                    Text(error)
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(Color(red: 0.82, green: 0.24, blue: 0.24))
+                }
+
+                if model.modelProxyState.requiresCodexRelaunch {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Codex reopen required")
+                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+                        Text("The provider routing changed. Reopen Codex once so new chats bind to the current proxy state.")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(palette.secondaryText)
+
+                        Button(action: {
+                            Task { _ = await model.restartCodex() }
+                        }) {
+                            HStack(spacing: 8) {
+                                if model.isRestartingCodex {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .tint(.white)
+                                } else {
+                                    Image(systemName: "arrow.clockwise.circle.fill")
+                                }
+                                Text(model.isRestartingCodex ? "Reopening…" : "Reopen Codex")
+                                    .font(.system(.caption, design: .rounded, weight: .bold))
+                            }
+                        }
+                        .buttonStyle(SwitchButtonStyle(isActive: model.isRestartingCodex))
+                        .disabled(model.isRestartingCodex)
+                    }
+                    .padding(12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(palette.subtleFill)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .stroke(palette.cardStroke, lineWidth: 1)
+                            )
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Endpoint settings")
+                        .font(.system(.headline, design: .rounded, weight: .semibold))
+                        .foregroundStyle(palette.primaryText)
+
+                    HStack(spacing: 10) {
+                        TextField("Port", text: $modelProxyPortText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                            .frame(width: 86)
+
+                        TextField("Upstream base URL", text: $modelProxyUpstreamText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                    }
+
+                    Text("Local endpoint is generated from the port. Upstream base URL is the service the proxy forwards requests to.")
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(palette.secondaryText)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Model limits")
+                        .font(.system(.headline, design: .rounded, weight: .semibold))
+                        .foregroundStyle(palette.primaryText)
+
+                    HStack(spacing: 10) {
+                        TextField("Context window", text: $modelContextWindowText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+
+                        TextField("Token limit %", text: $modelTokenLimitPercentText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                            .frame(width: 118)
+                    }
+
+                    HStack(spacing: 8) {
+                        Text("Model")
+                            .font(.system(.caption, design: .rounded, weight: .bold))
+                            .foregroundStyle(palette.secondaryText)
+                        Text(model.modelProxyRuntimeModel.name)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(palette.primaryText)
+                    }
+
+                    if let contextWindow = model.modelProxyRuntimeModel.contextWindow,
+                       let tokenLimit = model.modelProxyRuntimeModel.autoCompactTokenLimit {
+                        Text("Current auto-compact threshold: \(tokenLimit.formatted()) / \(contextWindow.formatted()) tokens")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        Task {
+                            _ = await model.saveModelProxySettings(
+                                portText: modelProxyPortText,
+                                upstreamText: modelProxyUpstreamText
+                            )
+                        }
+                    } label: {
+                        Label("Save", systemImage: "checkmark.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    if model.modelProxyState.isEnabled {
+                        Button {
+                            Task { await model.restartModelProxy() }
+                        } label: {
+                            Label("Restart", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(model.modelProxyState.endpoint, forType: .string)
+                    } label: {
+                        Label("Copy endpoint", systemImage: "link")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        Task {
+                            let didSave = await model.saveModelProxyRuntimeSettings(
+                                contextWindowText: modelContextWindowText,
+                                tokenLimitPercentText: modelTokenLimitPercentText
+                            )
+                            if didSave {
+                                loadModelProxySettingsDraft()
+                            }
+                        }
+                    } label: {
+                        Label("Save limits", systemImage: "dial.high")
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
     }
 
     private var bulkActionBar: some View {
@@ -1602,9 +1942,7 @@ struct ActiveProfileSpotlightCard: View {
     let sparklineValues: [Int]
     let healthBadges: [ProfileHealthBadgeDescriptor]
     let recommendation: ProfileSwitchRecommendation?
-    let isRestartingCodex: Bool
     let onToggleFavorite: () -> Void
-    let onReopen: () -> Void
     let onSwitchRecommended: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
@@ -1724,25 +2062,6 @@ struct ActiveProfileSpotlightCard: View {
                                 .stroke(palette.cardStroke, lineWidth: 1)
                         )
                 )
-            }
-
-            HStack(spacing: 10) {
-                Button(action: onReopen) {
-                    HStack(spacing: 8) {
-                        if isRestartingCodex {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(.white)
-                        } else {
-                            Image(systemName: "arrow.clockwise.circle.fill")
-                        }
-                        Text(isRestartingCodex ? "Reopening…" : "Reopen Codex")
-                            .font(.system(.caption, design: .rounded, weight: .bold))
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(SwitchButtonStyle(isActive: isRestartingCodex))
-                .disabled(isRestartingCodex)
             }
         }
         .padding(16)
@@ -2640,57 +2959,6 @@ struct UnsavedSwitchOverlay: View {
     }
 }
 
-struct CodexRelaunchOverlay: View {
-    @ObservedObject var model: CodexProfilesViewModel
-    let prompt: CodexRelaunchPrompt
-    let onClose: () -> Void
-
-    var body: some View {
-        OverlayCard {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Reopen Codex now?")
-                    .font(.system(.title3, design: .rounded, weight: .bold))
-
-                Text("The profile has been switched to \(prompt.profileName). Reopening Codex will make the new profile available right away.")
-                    .foregroundStyle(.secondary)
-
-                HStack(spacing: 10) {
-                    Button("Later") {
-                        onClose()
-                    }
-                    .disabled(model.isRestartingCodex)
-
-                    Spacer()
-
-                    Button(action: {
-                        Task {
-                            let didRestart = await model.restartCodex()
-                            await MainActor.run {
-                                if didRestart {
-                                    onClose()
-                                }
-                            }
-                        }
-                    }) {
-                        HStack(spacing: 8) {
-                            if model.isRestartingCodex {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .tint(.white)
-                            }
-                            Text(model.isRestartingCodex ? "Reopening…" : "Reopen Codex")
-                        }
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(model.isRestartingCodex)
-                }
-                .animation(.easeInOut(duration: 0.18), value: model.isRestartingCodex)
-            }
-            .frame(width: 356)
-        }
-    }
-}
-
 struct OverlayCard<Content: View>: View {
     @ViewBuilder let content: Content
 
@@ -3014,6 +3282,31 @@ struct FlowLayout: Layout {
     }
 }
 
+private enum MainPanelTab: String, CaseIterable, Identifiable {
+    case profiles
+    case proxy
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .profiles:
+            return "Profiles"
+        case .proxy:
+            return "Proxy"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .profiles:
+            return "person.2.fill"
+        case .proxy:
+            return "point.3.connected.trianglepath.dotted"
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: CodexProfilesViewModel
     let resolvedColorScheme: ColorScheme
@@ -3021,7 +3314,7 @@ struct SettingsView: View {
     var onClose: (() -> Void)?
     @AppStorage(Preferences.showIDsKey) private var showIDs = false
     @AppStorage(Preferences.autoRefreshKey) private var autoRefreshEnabled = true
-    @AppStorage(Preferences.promptReopenCodexKey) private var promptReopenCodex = true
+    @AppStorage(Preferences.autoRefreshIntervalKey) private var autoRefreshInterval = UsageRefreshIntervalOption.default.rawValue
     @AppStorage(Preferences.panelThemeKey) private var panelTheme = PanelTheme.system.rawValue
     @AppStorage(Preferences.compactModeKey) private var compactMode = false
     @AppStorage(Preferences.groupingKey) private var grouping = ProfileGrouping.none.rawValue
@@ -3073,6 +3366,14 @@ struct SettingsView: View {
             get: { AccentTheme.cgColor() },
             set: { AccentTheme.save($0) }
         )
+    }
+
+    private var selectedRefreshInterval: UsageRefreshIntervalOption {
+        UsageRefreshIntervalOption(rawValue: autoRefreshInterval) ?? .default
+    }
+
+    private var usesProxyDrivenRefresh: Bool {
+        model.modelProxyState.isRunning
     }
 
     var body: some View {
@@ -3260,27 +3561,36 @@ struct SettingsView: View {
                     )
                 ) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Refresh usage automatically every minute")
+                        Text("Refresh usage automatically")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("Keeps usage and status fresh while the app is running.")
-                            .font(.system(.caption, design: .rounded))
-                            .foregroundStyle(palette.secondaryText)
                     }
                 }
                 .toggleStyle(.switch)
 
-                Toggle(isOn: $promptReopenCodex) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Ask to reopen Codex after switching")
+                if autoRefreshEnabled, !usesProxyDrivenRefresh {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Refresh interval")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("Shows a prompt after profile switches so the new session can be used right away.")
-                            .font(.system(.caption, design: .rounded))
-                            .foregroundStyle(palette.secondaryText)
+                        Picker(
+                            "Refresh interval",
+                            selection: Binding(
+                                get: { selectedRefreshInterval.rawValue },
+                                set: { seconds in
+                                    autoRefreshInterval = seconds
+                                    model.setAutoRefreshInterval(seconds)
+                                }
+                            )
+                        ) {
+                            ForEach(UsageRefreshIntervalOption.allCases) { option in
+                                Text(option.shortTitle).tag(option.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented)
                     }
                 }
-                .toggleStyle(.switch)
+
             }
         }
     }
@@ -3462,6 +3772,49 @@ struct StartupStatusBadge: View {
         case .unavailable:
             Color.red.opacity(0.12)
         }
+    }
+}
+
+struct ProxyStatusBadge: View {
+    let state: ModelProxyState
+
+    var body: some View {
+        Text(title)
+            .font(.system(.caption, design: .rounded, weight: .bold))
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(background, in: Capsule())
+    }
+
+    private var title: String {
+        if state.isRunning {
+            return "Running"
+        }
+        if state.isEnabled {
+            return "Error"
+        }
+        return "Off"
+    }
+
+    private var foreground: Color {
+        if state.isRunning {
+            return Color(red: 0.10, green: 0.54, blue: 0.29)
+        }
+        if state.isEnabled {
+            return Color(red: 0.63, green: 0.26, blue: 0.26)
+        }
+        return Color(red: 0.28, green: 0.35, blue: 0.49)
+    }
+
+    private var background: Color {
+        if state.isRunning {
+            return Color.green.opacity(0.14)
+        }
+        if state.isEnabled {
+            return Color.red.opacity(0.12)
+        }
+        return Color.gray.opacity(0.15)
     }
 }
 

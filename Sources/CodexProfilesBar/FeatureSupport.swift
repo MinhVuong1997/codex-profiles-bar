@@ -314,7 +314,7 @@ extension ProfileStatus {
 
 extension UsageBucket {
     var effectiveRemainingPercent: Int? {
-        [fiveHour?.leftPercent, weekly?.leftPercent].compactMap { $0 }.min()
+        fiveHour?.leftPercent ?? weekly?.leftPercent
     }
 
     var isDepleted: Bool {

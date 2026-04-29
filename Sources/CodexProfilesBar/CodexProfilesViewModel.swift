@@ -24,9 +24,9 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     @Published private(set) var isDoctorLoading = false
     @Published private(set) var isUpdatingLaunchAtLogin = false
     @Published private(set) var isRefreshingProfiles = false
+    @Published private(set) var isRefreshButtonLoading = false
     @Published private(set) var isAutoRefreshEnabled: Bool
     @Published private(set) var switchingProfileID: String?
-    @Published private(set) var codexRelaunchPrompt: CodexRelaunchPrompt?
     @Published private(set) var isRestartingCodex = false
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var usageHistoryByProfileID: [String: [ProfileUsageHistoryPoint]] = [:]
@@ -38,12 +38,15 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     @Published private(set) var notificationInboxItems: [NotificationInboxItem] = []
     @Published private(set) var recommendedSwitch: ProfileSwitchRecommendation?
     @Published private(set) var activeImportPreview: PendingImportPreview?
+    @Published private(set) var modelProxyState = ModelProxyState.disabled
+    @Published private(set) var modelProxyRuntimeModel = ModelProxyRuntimeModel(name: "gpt-5.5", contextWindow: nil, autoCompactTokenLimit: nil)
     @Published var banner: BannerMessage?
 
     private let service = CodexProfilesService.shared
+    private let modelProxyServer = CodexModelProxyServer()
     private let launchAtLoginManager = LaunchAtLoginManager()
     private let notificationCenter = UNUserNotificationCenter.current()
-    private let autoRefreshInterval: Duration = .seconds(60)
+    private let proxyRefreshDebounce: Duration = .seconds(1)
     private let fileManager = FileManager.default
     private let updateDownloadSession: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -54,6 +57,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private let updateFeedURL = URL(string: "https://api.github.com/repos/MinhVuong1997/codex-profiles-bar/releases/latest")!
     private var bannerDismissTask: Task<Void, Never>?
     private var autoRefreshTask: Task<Void, Never>?
+    private var proxyRefreshTask: Task<Void, Never>?
     private var switchReconcileTask: Task<Void, Never>?
     private var favorites: [String]
     private var orderedProfileIDs: [String]
@@ -63,7 +67,6 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private var hasLoadedUsageHistory = false
     private var isPerformingAutomaticSwitch = false
     private var presentedUpdateVersion: String?
-
     override init() {
         let storedAutoRefresh = UserDefaults.standard.object(forKey: Preferences.autoRefreshKey) as? Bool
         isAutoRefreshEnabled = storedAutoRefresh ?? true
@@ -71,10 +74,18 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         orderedProfileIDs = UserDefaults.standard.stringArray(forKey: Preferences.orderedProfileIDsKey) ?? []
         super.init()
         packagingSupport = Self.resolvePackagingSupport()
+        modelProxyState = Self.loadModelProxyState()
         loadNotificationInbox()
         refreshLaunchAtLoginState()
         configureAutoRefreshLoop()
         Task {
+            await refreshModelProxyRoutingState()
+            await refreshModelProxyRuntimeModel()
+            if modelProxyState.isEnabled {
+                try? await syncCodexRoutingToProxyEnabledState(true)
+                await startModelProxy(shouldShowBanner: false)
+                await refreshModelProxyRoutingState()
+            }
             await requestNotificationAuthorizationIfNeeded()
             await refreshDetectedCodexVersion()
             await checkForUpdates(userInitiated: false)
@@ -86,6 +97,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     deinit {
         switchReconcileTask?.cancel()
         autoRefreshTask?.cancel()
+        proxyRefreshTask?.cancel()
         bannerDismissTask?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
@@ -169,7 +181,189 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     func setAutoRefreshEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Preferences.autoRefreshKey)
         isAutoRefreshEnabled = enabled
+        if !enabled {
+            proxyRefreshTask?.cancel()
+        }
         configureAutoRefreshLoop()
+    }
+
+    func setAutoRefreshInterval(_ seconds: Int) {
+        UserDefaults.standard.set(Self.normalizedAutoRefreshInterval(seconds), forKey: Preferences.autoRefreshIntervalKey)
+        configureAutoRefreshLoop()
+    }
+
+    func refreshModelProxyRuntimeModel() async {
+        do {
+            modelProxyRuntimeModel = try await service.currentModelProxyRuntimeModel()
+        } catch {
+            modelProxyRuntimeModel = ModelProxyRuntimeModel(name: "gpt-5.5", contextWindow: nil, autoCompactTokenLimit: nil)
+        }
+    }
+
+    func setModelProxyEnabled(_ enabled: Bool) async {
+        do {
+            if enabled {
+                try await syncCodexRoutingToProxyEnabledState(true)
+                UserDefaults.standard.set(true, forKey: Preferences.modelProxyEnabledKey)
+                modelProxyState.isEnabled = true
+                await startModelProxy(shouldShowBanner: false)
+                configureAutoRefreshLoop()
+
+                guard modelProxyState.isRunning else {
+                    showBanner(title: "Proxy failed", body: modelProxyState.lastError ?? "Could not start the local proxy.", tone: .error)
+                    return
+                }
+
+                showBanner(
+                    title: "Model proxy running",
+                    body: "Codex now points to the local provider proxy.",
+                    tone: .success
+                )
+            } else {
+                try await syncCodexRoutingToProxyEnabledState(false)
+                UserDefaults.standard.set(false, forKey: Preferences.modelProxyEnabledKey)
+                await modelProxyServer.stop()
+                modelProxyState.isEnabled = false
+                modelProxyState.isRunning = false
+                modelProxyState.lastError = nil
+                proxyRefreshTask?.cancel()
+                configureAutoRefreshLoop()
+                showBanner(
+                    title: "Model proxy stopped",
+                    body: "Codex routing was restored.",
+                    tone: .success
+                )
+            }
+        } catch {
+            modelProxyState.lastError = error.localizedDescription
+            showBanner(title: "Proxy failed", body: error.localizedDescription, tone: .error)
+        }
+    }
+
+    @discardableResult
+    func saveModelProxySettings(portText: String, upstreamText: String) async -> Bool {
+        let trimmedPort = portText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedUpstream = upstreamText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let port = Int(trimmedPort), (1...65_535).contains(port) else {
+            showBanner(title: "Invalid proxy port", body: "Use a port between 1 and 65535.", tone: .error)
+            return false
+        }
+
+        guard Self.validModelProxyUpstreamURL(trimmedUpstream) != nil else {
+            showBanner(title: "Invalid upstream URL", body: "Use an http or https base URL.", tone: .error)
+            return false
+        }
+
+        UserDefaults.standard.set(port, forKey: Preferences.modelProxyPortKey)
+        UserDefaults.standard.set(trimmedUpstream, forKey: Preferences.modelProxyUpstreamKey)
+        modelProxyState.port = port
+        modelProxyState.endpoint = Self.modelProxyEndpointString(port: port)
+        modelProxyState.codexBaseURL = Self.modelProxyCodexBaseURLString(port: port)
+        modelProxyState.upstreamBaseURL = trimmedUpstream
+
+        if modelProxyState.isEnabled {
+            do {
+                try await syncCodexRoutingToProxyEnabledState(true)
+                await startModelProxy(shouldShowBanner: false)
+                configureAutoRefreshLoop()
+                guard modelProxyState.isRunning else {
+                    showBanner(title: "Proxy failed", body: modelProxyState.lastError ?? "Could not restart the local proxy.", tone: .error)
+                    return false
+                }
+                showBanner(
+                    title: "Proxy settings saved",
+                    body: "Codex was repointed to the new local provider URL.",
+                    tone: .success
+                )
+            } catch {
+                modelProxyState.lastError = error.localizedDescription
+                showBanner(title: "Proxy failed", body: error.localizedDescription, tone: .error)
+                return false
+            }
+        } else {
+            showBanner(title: "Proxy settings saved", body: "Enable the model proxy when you are ready to use it.", tone: .success)
+        }
+        return true
+    }
+
+    @discardableResult
+    func saveModelProxyRuntimeSettings(contextWindowText: String, tokenLimitPercentText: String) async -> Bool {
+        let trimmedContextWindow = contextWindowText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTokenLimitPercent = tokenLimitPercentText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let contextWindow: Int?
+        if trimmedContextWindow.isEmpty {
+            contextWindow = nil
+        } else {
+            guard let parsedContextWindow = Int(trimmedContextWindow), parsedContextWindow > 0 else {
+                showBanner(title: "Invalid context window", body: "Enter a whole number greater than 0.", tone: .error)
+                return false
+            }
+            contextWindow = parsedContextWindow
+        }
+
+        let tokenLimitPercent: Int?
+        if trimmedTokenLimitPercent.isEmpty {
+            tokenLimitPercent = nil
+        } else {
+            guard let parsedTokenLimitPercent = Int(trimmedTokenLimitPercent), (1...100).contains(parsedTokenLimitPercent) else {
+                showBanner(title: "Invalid token limit", body: "Enter a percentage between 1 and 100.", tone: .error)
+                return false
+            }
+            tokenLimitPercent = parsedTokenLimitPercent
+        }
+
+        if tokenLimitPercent != nil, contextWindow == nil {
+            showBanner(title: "Context window required", body: "Set a context window before saving a token limit percentage.", tone: .error)
+            return false
+        }
+
+        let autoCompactTokenLimit = tokenLimitPercent.flatMap { percent in
+            contextWindow.map { max(1, Int((Double($0) * Double(percent) / 100.0).rounded())) }
+        }
+
+        do {
+            modelProxyRuntimeModel = try await service.setModelProxyRuntimeModel(
+                contextWindow: contextWindow,
+                autoCompactTokenLimit: autoCompactTokenLimit
+            )
+            let body: String
+            if let contextWindow, let tokenLimitPercent, let autoCompactTokenLimit {
+                body = "Context window set to \(contextWindow.formatted()) with auto-compact at \(tokenLimitPercent)% (\(autoCompactTokenLimit.formatted()) tokens)."
+            } else if let contextWindow {
+                body = "Context window set to \(contextWindow.formatted())."
+            } else {
+                body = "Model limits were cleared from Codex config."
+            }
+            showBanner(title: "Model limits saved", body: body, tone: .success)
+            return true
+        } catch {
+            showBanner(title: "Could not save model limits", body: error.localizedDescription, tone: .error)
+            return false
+        }
+    }
+
+    func restartModelProxy() async {
+        do {
+            try await syncCodexRoutingToProxyEnabledState(true)
+            UserDefaults.standard.set(true, forKey: Preferences.modelProxyEnabledKey)
+            modelProxyState.isEnabled = true
+            await startModelProxy(shouldShowBanner: false)
+            configureAutoRefreshLoop()
+            guard modelProxyState.isRunning else {
+                showBanner(title: "Proxy failed", body: modelProxyState.lastError ?? "Could not restart the local proxy.", tone: .error)
+                return
+            }
+            showBanner(
+                title: "Model proxy restarted",
+                body: "Local proxy is back.",
+                tone: .success
+            )
+        } catch {
+            modelProxyState.lastError = error.localizedDescription
+            showBanner(title: "Proxy failed", body: error.localizedDescription, tone: .error)
+        }
     }
 
     func isFavorite(_ profile: ProfileStatus) -> Bool {
@@ -265,6 +459,9 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
             normalizeStoredOrdering()
             profiles = sortProfiles(profiles)
+            updateModelProxyActiveProfileName()
+            await refreshModelProxyRoutingState()
+            await refreshModelProxyRuntimeModel()
 
             if let storage = detectedStorage {
                 loadUsageHistoryIfNeeded(storage: storage)
@@ -289,6 +486,13 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 showBanner(title: "Refresh failed", body: error.localizedDescription, tone: .error)
             }
         }
+    }
+
+    func refreshFromUserAction() async {
+        guard !isRefreshButtonLoading else { return }
+        isRefreshButtonLoading = true
+        defer { isRefreshButtonLoading = false }
+        await refresh(trigger: .manual)
     }
 
     @discardableResult
@@ -331,10 +535,6 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 body: successBody ?? "Now using \(profile.primaryText).",
                 tone: .success
             )
-            let reopenPromptPreference = UserDefaults.standard.object(forKey: Preferences.promptReopenCodexKey) as? Bool ?? true
-            if shouldPromptReopen ?? reopenPromptPreference {
-                codexRelaunchPrompt = CodexRelaunchPrompt(profileName: profile.primaryText)
-            }
             queueSwitchReconcile(for: profile, mode: mode)
             return true
         } catch {
@@ -602,7 +802,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func configureAutoRefreshLoop() {
         autoRefreshTask?.cancel()
-        guard isAutoRefreshEnabled else {
+        guard isAutoRefreshEnabled, !usesProxyDrivenRefresh else {
             autoRefreshTask = nil
             return
         }
@@ -737,6 +937,129 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 return
             }
         }
+    }
+
+    private func startModelProxy(shouldShowBanner: Bool) async {
+        let port = Self.storedModelProxyPort()
+        let upstreamText = Self.storedModelProxyUpstream()
+
+        guard let upstreamURL = Self.validModelProxyUpstreamURL(upstreamText) else {
+            modelProxyState = ModelProxyState(
+                isEnabled: true,
+                isRunning: false,
+                endpoint: Self.modelProxyEndpointString(port: port),
+                codexBaseURL: Self.modelProxyCodexBaseURLString(port: port),
+                port: port,
+                upstreamBaseURL: upstreamText,
+                activeProfileName: currentProfile?.primaryText,
+                isCodexConfigured: modelProxyState.isCodexConfigured,
+                requiresCodexRelaunch: modelProxyState.requiresCodexRelaunch,
+                lastError: "Invalid upstream URL."
+            )
+            if shouldShowBanner {
+                showBanner(title: "Proxy failed", body: "Use an http or https upstream base URL.", tone: .error)
+            }
+            return
+        }
+
+        do {
+            let endpoint = try await modelProxyServer.start(
+                port: port,
+                upstreamBaseURL: upstreamURL,
+                runtimeModelProvider: { [service] in
+                    try await service.currentModelProxyRuntimeModel()
+                }
+            ) { [service] in
+                try await service.activeModelProxyCredential()
+            }
+
+            modelProxyState = ModelProxyState(
+                isEnabled: true,
+                isRunning: true,
+                endpoint: endpoint.absoluteString,
+                codexBaseURL: Self.modelProxyCodexBaseURLString(port: port),
+                port: port,
+                upstreamBaseURL: upstreamText,
+                activeProfileName: currentProfile?.primaryText,
+                isCodexConfigured: modelProxyState.isCodexConfigured,
+                requiresCodexRelaunch: modelProxyState.requiresCodexRelaunch,
+                lastError: nil
+            )
+            if shouldShowBanner {
+                showBanner(title: "Model proxy running", body: "Use \(endpoint.absoluteString) as the model base URL.", tone: .success)
+            }
+        } catch {
+            modelProxyState = ModelProxyState(
+                isEnabled: true,
+                isRunning: false,
+                endpoint: Self.modelProxyEndpointString(port: port),
+                codexBaseURL: Self.modelProxyCodexBaseURLString(port: port),
+                port: port,
+                upstreamBaseURL: upstreamText,
+                activeProfileName: currentProfile?.primaryText,
+                isCodexConfigured: modelProxyState.isCodexConfigured,
+                requiresCodexRelaunch: modelProxyState.requiresCodexRelaunch,
+                lastError: error.localizedDescription
+            )
+            if shouldShowBanner {
+                showBanner(title: "Proxy failed", body: error.localizedDescription, tone: .error)
+            }
+        }
+    }
+
+    private func updateModelProxyActiveProfileName() {
+        modelProxyState.activeProfileName = currentProfile?.primaryText
+    }
+
+    private func refreshModelProxyRoutingState() async {
+        let port = Self.storedModelProxyPort()
+        modelProxyState.endpoint = Self.modelProxyEndpointString(port: port)
+        modelProxyState.codexBaseURL = Self.modelProxyCodexBaseURLString(port: port)
+
+        do {
+            let providerKey = try await service.currentModelProviderKey()
+            let providerBaseURL = try await service.currentModelProviderBaseURL(key: Self.modelProxyProviderKey)
+            modelProxyState.isCodexConfigured = providerKey == Self.modelProxyProviderKey
+                && providerBaseURL == Self.modelProxyCodexBaseURLString(port: port)
+        } catch {
+            modelProxyState.isCodexConfigured = false
+        }
+    }
+
+    private func syncCodexRoutingToProxyEnabledState(_ enabled: Bool) async throws {
+        let desiredBaseURL = Self.modelProxyCodexBaseURLString(port: Self.storedModelProxyPort())
+        if enabled {
+            let currentProvider = try await service.currentModelProviderKey()
+            let currentBaseURL = try await service.currentModelProviderBaseURL(key: Self.modelProxyProviderKey)
+            if currentProvider != Self.modelProxyProviderKey {
+                UserDefaults.standard.set(currentProvider, forKey: Preferences.modelProxyPreviousModelProviderKey)
+            }
+            try await service.upsertModelProxyProviderConfig(
+                key: Self.modelProxyProviderKey,
+                name: "Codex Profiles Bar",
+                baseURL: desiredBaseURL
+            )
+            let didChangeProvider = currentProvider != Self.modelProxyProviderKey
+            let didChangeBaseURL = currentBaseURL != desiredBaseURL
+            if didChangeProvider {
+                try await service.setCurrentModelProviderKey(Self.modelProxyProviderKey)
+            }
+            modelProxyState.requiresCodexRelaunch = didChangeProvider || didChangeBaseURL
+        } else {
+            let previousProvider = UserDefaults.standard.string(forKey: Preferences.modelProxyPreviousModelProviderKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let currentProvider = try await service.currentModelProviderKey()
+            if let previousProvider, !previousProvider.isEmpty {
+                try await service.setCurrentModelProviderKey(previousProvider)
+            } else {
+                try await service.setCurrentModelProviderKey(nil)
+            }
+            try await service.removeModelProxyProviderConfig(key: Self.modelProxyProviderKey)
+            UserDefaults.standard.removeObject(forKey: Preferences.modelProxyPreviousModelProviderKey)
+            modelProxyState.requiresCodexRelaunch = currentProvider == Self.modelProxyProviderKey
+        }
+
+        await refreshModelProxyRoutingState()
     }
 
     private func updateProfileLocally(
@@ -888,6 +1211,24 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             name: .reopenCodexFromNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleModelProxyRequestCompletedNotification),
+            name: .modelProxyDidCompleteRequest,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleModelProxyUsageLimitNotification),
+            name: .modelProxyDidHitUsageLimit,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppWillTerminateNotification),
+            name: .codexProfilesBarWillTerminate,
+            object: nil
+        )
     }
 
     @objc
@@ -895,6 +1236,49 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         Task { @MainActor in
             _ = await restartCodex()
         }
+    }
+
+    @objc
+    private func handleModelProxyRequestCompletedNotification(_ notification: Notification) {
+        scheduleProxyDrivenRefresh()
+    }
+
+    @objc
+    private func handleModelProxyUsageLimitNotification() {
+        Task { @MainActor in
+            await autoSwitchFromUsageLimitIfNeeded()
+        }
+    }
+
+    @objc
+    private func handleAppWillTerminateNotification() {
+        flushPersistenceToDisk()
+    }
+
+    private func scheduleProxyDrivenRefresh() {
+        guard isAutoRefreshEnabled, usesProxyDrivenRefresh else { return }
+
+        proxyRefreshTask?.cancel()
+        proxyRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: proxyRefreshDebounce)
+            guard !Task.isCancelled else { return }
+            await refresh(trigger: .automatic)
+        }
+    }
+
+    private func ensurePersistenceURLs() {
+        if detectedStorage == nil, let resolvedStorage = try? service.resolveStorage() {
+            detectedStorage = resolvedStorage
+        }
+        if usageHistoryURL == nil, let detectedStorage {
+            usageHistoryURL = detectedStorage.url.appendingPathComponent("profiles-bar-usage-history.json")
+        }
+    }
+
+    private func flushPersistenceToDisk() {
+        ensurePersistenceURLs()
+        persistUsageSnapshotsIfNeeded()
     }
 
     private func refreshDetectedCodexVersion() async {
@@ -1015,6 +1399,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     }
 
     private func persistUsageSnapshotsIfNeeded() {
+        ensurePersistenceURLs()
         guard usageHistoryURL != nil || detectedStorage != nil else { return }
         if usageHistoryURL == nil, let detectedStorage {
             usageHistoryURL = detectedStorage.url.appendingPathComponent("profiles-bar-usage-history.json")
@@ -1191,9 +1576,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         guard autoSwitchEnabled, !isPerformingAutomaticSwitch else { return }
         guard let current = profiles.first(where: \.isCurrent), current.isUsageDepleted else { return }
 
-        guard let fallback = savedProfiles
-            .filter({ !$0.isCurrent && ($0.usageDisplayPercent ?? 0) > 0 })
-            .max(by: { ($0.usageDisplayPercent ?? 0) < ($1.usageDisplayPercent ?? 0) }) else {
+        guard let fallback = bestAutoSwitchFallback() else {
             return
         }
 
@@ -1219,6 +1602,39 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 inboxActionLabel: "Reopen Codex"
             )
         }
+    }
+
+    private func autoSwitchFromUsageLimitIfNeeded() async {
+        let autoSwitchEnabled = UserDefaults.standard.object(forKey: Preferences.autoSwitchOnDepletionKey) as? Bool ?? false
+        guard autoSwitchEnabled, !isPerformingAutomaticSwitch else { return }
+        guard profiles.contains(where: \.isCurrent) else { return }
+        guard let fallback = bestAutoSwitchFallback() else { return }
+
+        isPerformingAutomaticSwitch = true
+        defer { isPerformingAutomaticSwitch = false }
+
+        let switched = await switchToProfile(
+            fallback,
+            mode: .standard,
+            shouldPromptReopen: false,
+            successTitle: "Auto-switched profile",
+            successBody: "Switched to \(fallback.primaryText) because the current profile hit its usage limit."
+        )
+
+        if switched {
+            await scheduleNotification(
+                identifier: "auto-switch-limit-\(fallback.stableID)",
+                title: "Codex profile auto-switched",
+                body: "Now using \(fallback.primaryText) because the previous profile hit its usage limit.",
+                inboxTone: .warning
+            )
+        }
+    }
+
+    private func bestAutoSwitchFallback() -> ProfileStatus? {
+        savedProfiles
+            .filter({ !$0.isCurrent && ($0.usageDisplayPercent ?? 0) > 0 })
+            .max(by: { ($0.usageDisplayPercent ?? 0) < ($1.usageDisplayPercent ?? 0) })
     }
 
     private func scheduleNotification(
@@ -1390,10 +1806,6 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         banner = nil
     }
 
-    func dismissCodexRelaunchPrompt() {
-        codexRelaunchPrompt = nil
-    }
-
     func checkForUpdates(userInitiated: Bool = true) async {
         guard !isCheckingForUpdates else { return }
         guard let currentVersion = currentProfilesBarVersion() else {
@@ -1451,7 +1863,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
         do {
             try await restartCodexApplication()
-            codexRelaunchPrompt = nil
+            modelProxyState.requiresCodexRelaunch = false
             showBanner(
                 title: "Codex reopened",
                 body: "Codex has been reopened with the latest local profile state.",
@@ -1497,6 +1909,79 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
         return PackagingSupport(rootURL: rootURL, scriptsURL: scriptsURL, distURL: distURL)
     }
+
+    private static func loadModelProxyState() -> ModelProxyState {
+        let enabled = UserDefaults.standard.object(forKey: Preferences.modelProxyEnabledKey) as? Bool ?? false
+        let port = storedModelProxyPort()
+        let upstream = storedModelProxyUpstream()
+        return ModelProxyState(
+            isEnabled: enabled,
+            isRunning: false,
+            endpoint: modelProxyEndpointString(port: port),
+            codexBaseURL: modelProxyCodexBaseURLString(port: port),
+            port: port,
+            upstreamBaseURL: upstream,
+            activeProfileName: nil,
+            isCodexConfigured: false,
+            requiresCodexRelaunch: false,
+            lastError: nil
+        )
+    }
+
+    private static func storedModelProxyPort() -> Int {
+        let stored = UserDefaults.standard.integer(forKey: Preferences.modelProxyPortKey)
+        guard (1...65_535).contains(stored) else {
+            return ModelProxyState.defaultPort
+        }
+        return stored
+    }
+
+    private static func storedModelProxyUpstream() -> String {
+        let stored = UserDefaults.standard.string(forKey: Preferences.modelProxyUpstreamKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let stored, !stored.isEmpty else {
+            return ModelProxyState.defaultUpstreamBaseURL
+        }
+        if stored.caseInsensitiveCompare(legacyModelProxyUpstreamBaseURL) == .orderedSame {
+            UserDefaults.standard.set(ModelProxyState.defaultUpstreamBaseURL, forKey: Preferences.modelProxyUpstreamKey)
+            return ModelProxyState.defaultUpstreamBaseURL
+        }
+        return stored
+    }
+
+    private static func normalizedAutoRefreshInterval(_ seconds: Int) -> Int {
+        UsageRefreshIntervalOption(rawValue: seconds)?.rawValue ?? UsageRefreshIntervalOption.default.rawValue
+    }
+
+    private static func storedAutoRefreshInterval() -> Int {
+        let stored = UserDefaults.standard.integer(forKey: Preferences.autoRefreshIntervalKey)
+        let normalized = normalizedAutoRefreshInterval(stored)
+        if stored != normalized {
+            UserDefaults.standard.set(normalized, forKey: Preferences.autoRefreshIntervalKey)
+        }
+        return normalized
+    }
+
+    private static func validModelProxyUpstreamURL(_ value: String) -> URL? {
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else {
+            return nil
+        }
+        return url
+    }
+
+    private static func modelProxyEndpointString(port: Int) -> String {
+        "http://127.0.0.1:\(port)/v1"
+    }
+
+    private static func modelProxyCodexBaseURLString(port: Int) -> String {
+        modelProxyEndpointString(port: port)
+    }
+
+    private static let legacyModelProxyUpstreamBaseURL = "https://api.openai.com/v1"
+    private static let modelProxyProviderKey = "codex-profiles-bar"
 
     private static var packageRootURL: URL? {
         var current = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
@@ -1549,7 +2034,6 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             process.executableURL = executable
             process.arguments = ["app", currentWorkspaceURL().path]
             try process.run()
-            codexRelaunchPrompt = nil
             return
         }
 
@@ -1960,5 +2444,15 @@ private extension String {
     var nonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+private extension CodexProfilesViewModel {
+    var autoRefreshInterval: Duration {
+        .seconds(Self.storedAutoRefreshInterval())
+    }
+
+    var usesProxyDrivenRefresh: Bool {
+        modelProxyState.isRunning
     }
 }

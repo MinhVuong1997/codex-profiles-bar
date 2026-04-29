@@ -8,6 +8,7 @@ actor CodexProfilesNativeEngine {
     private let refreshTokenURL = "https://auth.openai.com/oauth/token"
     private let refreshClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
     private let usageUserAgent = "codex-profiles-bar"
+    private let usageProxyBypassHeader = "X-Codex-Profiles-Bar-Use-Request-Credential"
     private let usageRetryAttempts = 3
     private let lockTimeout: TimeInterval = 10
     private let lockRetryDelayMicros: useconds_t = 200_000
@@ -109,6 +110,156 @@ actor CodexProfilesNativeEngine {
             }
             try writeProfilesIndex(index, paths: paths)
         }
+    }
+
+    func activeModelProxyCredential() async throws -> ModelProxyCredential {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+
+        let auth = try readAuthFile(at: paths.auth)
+        if var tokens = auth.tokens {
+            if nonEmpty(tokens.accessToken) == nil, nonEmpty(tokens.refreshToken) != nil {
+                tokens = try await refreshProfileTokens(at: paths.auth, currentTokens: tokens)
+            }
+
+            guard let accessToken = nonEmpty(tokens.accessToken) else {
+                throw CodexProfilesError.commandFailed("Active Codex profile is missing an access token.")
+            }
+
+            let accountID = tokenAccountID(tokens)
+            let snapshot = try loadSnapshot(paths: paths, strictLabels: false)
+            let currentID = currentSavedID(paths: paths, tokensByID: snapshot.tokensByID)
+            let label = currentID.flatMap { labelForID(snapshot.labels, id: $0) }
+            let email = extractEmailAndPlan(from: tokens).0
+            let profileName = label ?? email ?? accountID ?? "Current Codex session"
+
+            return ModelProxyCredential(
+                kind: .codexSession,
+                authorizationValue: "Bearer \(accessToken)",
+                accountID: accountID,
+                profileName: profileName
+            )
+        }
+
+        if let apiKey = nonEmpty(auth.openAIAPIKey) {
+            let suffix = apiKey.suffix(6)
+            return ModelProxyCredential(
+                kind: .apiKey,
+                authorizationValue: "Bearer \(apiKey)",
+                accountID: nil,
+                profileName: "API key ...\(suffix)"
+            )
+        }
+
+        throw CodexProfilesError.commandFailed("Auth file is missing tokens.")
+    }
+
+    func currentModelProxyRuntimeModel() throws -> ModelProxyRuntimeModel {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        let modelName = try readTopLevelConfigValue(paths: paths, key: "model") ?? "gpt-5.5"
+        let contextWindow = try readTopLevelIntConfigValue(paths: paths, key: "model_context_window")
+        let autoCompactTokenLimit = try readTopLevelIntConfigValue(paths: paths, key: "model_auto_compact_token_limit")
+        return ModelProxyRuntimeModel(
+            name: modelName,
+            contextWindow: contextWindow,
+            autoCompactTokenLimit: autoCompactTokenLimit
+        )
+    }
+
+    func currentChatGPTBaseURL() throws -> String {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        return try readBaseURL(paths: paths)
+    }
+
+    func setModelProxyRuntimeModel(contextWindow: Int?, autoCompactTokenLimit: Int?) throws -> ModelProxyRuntimeModel {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+
+        if let contextWindow, contextWindow <= 0 {
+            throw CodexProfilesError.commandFailed("Context window must be greater than 0.")
+        }
+        if let autoCompactTokenLimit, autoCompactTokenLimit <= 0 {
+            throw CodexProfilesError.commandFailed("Auto-compact token limit must be greater than 0.")
+        }
+        if let contextWindow, let autoCompactTokenLimit, autoCompactTokenLimit > contextWindow {
+            throw CodexProfilesError.commandFailed("Auto-compact token limit cannot exceed the context window.")
+        }
+
+        let contents = (try? String(contentsOf: paths.config, encoding: .utf8)) ?? ""
+        let withContextWindow = replaceRemoveOrAppendConfigLine(
+            contents: contents,
+            key: "model_context_window",
+            line: contextWindow.map { "model_context_window = \($0)" }
+        )
+        let updated = replaceRemoveOrAppendConfigLine(
+            contents: withContextWindow,
+            key: "model_auto_compact_token_limit",
+            line: autoCompactTokenLimit.map { "model_auto_compact_token_limit = \($0)" }
+        )
+        try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
+        return try currentModelProxyRuntimeModel()
+    }
+
+    func setChatGPTBaseURL(_ value: String) throws {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+
+        let normalized = try validateBaseURL(value)
+        let desiredLine = "chatgpt_base_url = \"\(normalized)\""
+        let contents = (try? String(contentsOf: paths.config, encoding: .utf8)) ?? ""
+        let updated = replaceOrAppendConfigLine(contents: contents, key: "chatgpt_base_url", line: desiredLine)
+        try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
+    }
+
+    func currentModelProviderKey() throws -> String? {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        return try readTopLevelConfigValue(paths: paths, key: "model_provider")
+    }
+
+    func currentModelProviderBaseURL(key: String) throws -> String? {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        return try readSectionConfigValue(paths: paths, section: "model_providers.\(key)", key: "base_url")
+    }
+
+    func setCurrentModelProviderKey(_ value: String?) throws {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        let contents = (try? String(contentsOf: paths.config, encoding: .utf8)) ?? ""
+        let updated = replaceRemoveOrAppendConfigLine(
+            contents: contents,
+            key: "model_provider",
+            line: value.map { "model_provider = \"\($0)\"" }
+        )
+        try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
+    }
+
+    func upsertModelProxyProviderConfig(key: String, name: String, baseURL: String) throws {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        let contents = (try? String(contentsOf: paths.config, encoding: .utf8)) ?? ""
+        let updated = upsertSection(
+            contents: contents,
+            header: "[model_providers.\(key)]",
+            entries: [
+                "name = \"\(name)\"",
+                "base_url = \"\(baseURL)\"",
+                "wire_api = \"responses\"",
+                "requires_openai_auth = false",
+            ]
+        )
+        try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
+    }
+
+    func removeModelProxyProviderConfig(key: String) throws {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        let contents = (try? String(contentsOf: paths.config, encoding: .utf8)) ?? ""
+        let updated = removeSection(contents: contents, header: "[model_providers.\(key)]")
+        try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
     }
 
     func setLabel(id: String, label: String) async throws {
@@ -1690,6 +1841,205 @@ private extension CodexProfilesNativeEngine {
         return stripped.isEmpty ? nil : stripped
     }
 
+    func readTopLevelConfigValue(paths: NativePaths, key: String) throws -> String? {
+        guard let contents = try? String(contentsOf: paths.config, encoding: .utf8) else {
+            return nil
+        }
+        var currentSection: String? = nil
+        for line in contents.split(whereSeparator: \.isNewline) {
+            let string = String(line)
+            if let section = parseSectionHeader(string) {
+                currentSection = section
+                continue
+            }
+            if currentSection == nil, let value = parseConfigValue(string, key: key) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    func readTopLevelIntConfigValue(paths: NativePaths, key: String) throws -> Int? {
+        guard let value = try readTopLevelConfigValue(paths: paths, key: key) else {
+            return nil
+        }
+        return parseIntegerConfigValue(value)
+    }
+
+    func readSectionConfigValue(paths: NativePaths, section: String, key: String) throws -> String? {
+        guard let contents = try? String(contentsOf: paths.config, encoding: .utf8) else {
+            return nil
+        }
+        var currentSection: String? = nil
+        for line in contents.split(whereSeparator: \.isNewline) {
+            let string = String(line)
+            if let parsedSection = parseSectionHeader(string) {
+                currentSection = parsedSection
+                continue
+            }
+            if currentSection == section, let value = parseConfigValue(string, key: key) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    func parseSectionHeader(_ line: String) -> String? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("["), trimmed.hasSuffix("]") else {
+            return nil
+        }
+        let inner = trimmed.dropFirst().dropLast().trimmingCharacters(in: .whitespacesAndNewlines)
+        return inner.isEmpty ? nil : inner
+    }
+
+    func replaceOrAppendConfigLine(contents: String, key: String, line: String) -> String {
+        replaceRemoveOrAppendConfigLine(contents: contents, key: key, line: line)
+    }
+
+    func replaceRemoveOrAppendConfigLine(contents: String, key: String, line: String?) -> String {
+        let hasTrailingNewline = contents.hasSuffix("\n")
+        var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var currentSection: String? = nil
+        var topLevelKeyIndex: Int? = nil
+        var misplacedIndexes = [Int]()
+
+        for index in lines.indices {
+            if let section = parseSectionHeader(lines[index]) {
+                currentSection = section
+                continue
+            }
+            guard isConfigKeyLine(lines[index], key: key) else { continue }
+            if currentSection == nil {
+                topLevelKeyIndex = topLevelKeyIndex ?? index
+            } else {
+                misplacedIndexes.append(index)
+            }
+        }
+
+        for index in misplacedIndexes.reversed() {
+            lines.remove(at: index)
+        }
+
+        if let topLevelKeyIndex {
+            if let line {
+                lines[topLevelKeyIndex] = line
+            } else {
+                lines.remove(at: topLevelKeyIndex)
+            }
+            let joined = lines.joined(separator: "\n")
+            return hasTrailingNewline ? joined : joined.trimmingCharacters(in: CharacterSet(charactersIn: "\n"))
+        }
+
+        guard let line else {
+            return hasTrailingNewline ? lines.joined(separator: "\n") : lines.joined(separator: "\n").trimmingCharacters(in: CharacterSet(charactersIn: "\n"))
+        }
+
+        if contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return line
+        }
+
+        let firstSectionIndex = lines.firstIndex(where: { parseSectionHeader($0) != nil }) ?? lines.count
+        if firstSectionIndex == lines.count {
+            var joined = lines.joined(separator: "\n")
+            if !joined.hasSuffix("\n") {
+                joined += "\n"
+            }
+            joined += line
+            return joined
+        }
+
+        lines.insert(line, at: firstSectionIndex)
+        if firstSectionIndex > 0, !lines[firstSectionIndex - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.insert("", at: firstSectionIndex)
+        }
+        let joined = lines.joined(separator: "\n")
+        return joined
+    }
+
+    func upsertSection(contents: String, header: String, entries: [String]) -> String {
+        let hasTrailingNewline = contents.hasSuffix("\n")
+        var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        let startIndex = lines.firstIndex { $0.trimmingCharacters(in: .whitespacesAndNewlines) == header }
+        if let startIndex {
+            var endIndex = lines.count
+            var cursor = startIndex + 1
+            while cursor < lines.count {
+                if parseSectionHeader(lines[cursor]) != nil {
+                    endIndex = cursor
+                    break
+                }
+                cursor += 1
+            }
+
+            var body = Array(lines[(startIndex + 1)..<endIndex])
+            for entry in entries {
+                guard let separator = entry.firstIndex(of: "=") else { continue }
+                let key = entry[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+                if let existingIndex = body.firstIndex(where: { isConfigKeyLine($0, key: key) }) {
+                    body[existingIndex] = entry
+                } else {
+                    body.append(entry)
+                }
+            }
+
+            lines.replaceSubrange((startIndex + 1)..<endIndex, with: body)
+            let joined = lines.joined(separator: "\n")
+            return hasTrailingNewline ? joined : joined.trimmingCharacters(in: CharacterSet(charactersIn: "\n"))
+        }
+
+        var joined = lines.joined(separator: "\n")
+        if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if !joined.hasSuffix("\n") {
+                joined += "\n"
+            }
+            joined += "\n"
+        }
+        joined += header + "\n" + entries.joined(separator: "\n")
+        return joined
+    }
+
+    func removeSection(contents: String, header: String) -> String {
+        let hasTrailingNewline = contents.hasSuffix("\n")
+        var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let startIndex = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == header }) else {
+            return contents
+        }
+
+        var lowerBound = startIndex
+        while lowerBound > 0 && lines[lowerBound - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lowerBound -= 1
+        }
+
+        var endIndex = lines.count
+        var cursor = startIndex + 1
+        while cursor < lines.count {
+            if parseSectionHeader(lines[cursor]) != nil {
+                endIndex = cursor
+                break
+            }
+            cursor += 1
+        }
+
+        while endIndex < lines.count && lines[endIndex].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            endIndex += 1
+        }
+
+        lines.removeSubrange(lowerBound..<endIndex)
+        let joined = lines.joined(separator: "\n")
+        return hasTrailingNewline ? joined : joined.trimmingCharacters(in: CharacterSet(charactersIn: "\n"))
+    }
+
+    func isConfigKeyLine(_ line: String, key: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let separator = trimmed.firstIndex(of: "=") else {
+            return false
+        }
+        let configKey = trimmed[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+        return configKey == key
+    }
+
     func stripInlineComment(_ value: String) -> String {
         var inSingle = false
         var inDouble = false
@@ -1708,6 +2058,14 @@ private extension CodexProfilesNativeEngine {
             result.append(character)
         }
         return result.trimmingCharacters(in: .whitespaces)
+    }
+
+    func parseIntegerConfigValue(_ value: String) -> Int? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        return Int(trimmed)
     }
 
     func validateBaseURL(_ value: String) throws -> String {
@@ -1766,6 +2124,7 @@ private extension CodexProfilesNativeEngine {
                 request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
                 request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
                 request.setValue(usageUserAgent, forHTTPHeaderField: "User-Agent")
+                request.setValue("1", forHTTPHeaderField: usageProxyBypassHeader)
 
                 let (data, response) = try await session.data(for: request)
                 guard let httpResponse = response as? HTTPURLResponse else {
