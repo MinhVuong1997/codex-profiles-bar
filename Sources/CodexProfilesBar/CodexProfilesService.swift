@@ -23,6 +23,49 @@ actor CodexProfilesService {
         try await engine.loadProfile(id: id, mode: mode)
     }
 
+    func activeModelProxyCredential() async throws -> ModelProxyCredential {
+        try await engine.activeModelProxyCredential()
+    }
+
+    func currentModelProxyRuntimeModel() async throws -> ModelProxyRuntimeModel {
+        try await engine.currentModelProxyRuntimeModel()
+    }
+
+    func currentChatGPTBaseURL() async throws -> String {
+        try await engine.currentChatGPTBaseURL()
+    }
+
+    func setModelProxyRuntimeModel(contextWindow: Int?, autoCompactTokenLimit: Int?) async throws -> ModelProxyRuntimeModel {
+        try await engine.setModelProxyRuntimeModel(
+            contextWindow: contextWindow,
+            autoCompactTokenLimit: autoCompactTokenLimit
+        )
+    }
+
+    func setChatGPTBaseURL(_ value: String) async throws {
+        try await engine.setChatGPTBaseURL(value)
+    }
+
+    func currentModelProviderKey() async throws -> String? {
+        try await engine.currentModelProviderKey()
+    }
+
+    func currentModelProviderBaseURL(key: String) async throws -> String? {
+        try await engine.currentModelProviderBaseURL(key: key)
+    }
+
+    func setCurrentModelProviderKey(_ value: String?) async throws {
+        try await engine.setCurrentModelProviderKey(value)
+    }
+
+    func upsertModelProxyProviderConfig(key: String, name: String, baseURL: String) async throws {
+        try await engine.upsertModelProxyProviderConfig(key: key, name: name, baseURL: baseURL)
+    }
+
+    func removeModelProxyProviderConfig(key: String) async throws {
+        try await engine.removeModelProxyProviderConfig(key: key)
+    }
+
     func setLabel(id: String, label: String) async throws {
         try await engine.setLabel(id: id, label: label)
     }
@@ -55,7 +98,7 @@ actor CodexProfilesService {
         try await engine.doctor(fix: fix)
     }
 
-    func resolveStorage() throws -> StorageResolution {
+    nonisolated func resolveStorage() throws -> StorageResolution {
         engine.resolveStorage()
     }
 }

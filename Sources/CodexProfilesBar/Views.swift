@@ -38,6 +38,11 @@ struct MenuBarRootView: View {
     @State private var pendingCenteredScrollProfileID: String?
     @State private var pendingTopScrollRequest = 0
     @State private var isTopScrollPending = false
+    @State private var selectedMainTab: MainPanelTab = .profiles
+    @State private var modelProxyPortText = "\(ModelProxyState.defaultPort)"
+    @State private var modelProxyEndpointSaveTask: Task<Void, Never>?
+    @State private var modelContextWindowText = ""
+    @State private var modelTokenLimitPercentText = ""
     private let scrollTopAnchorID = "profiles-scroll-top"
 
     private var palette: PanelPalette {
@@ -159,17 +164,6 @@ struct MenuBarRootView: View {
                 .zIndex(2)
             }
 
-            if let prompt = model.codexRelaunchPrompt {
-                CodexRelaunchOverlay(model: model, prompt: prompt) {
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
-                        model.dismissCodexRelaunchPrompt()
-                    }
-                }
-                .padding(14)
-                .transition(.scale(scale: 0.96).combined(with: .opacity))
-                .zIndex(2)
-            }
-
             if showQuickSwitch {
                 QuickSwitchOverlay(
                     query: $quickSwitchQuery,
@@ -213,10 +207,13 @@ struct MenuBarRootView: View {
             installLocalMouseMonitorIfNeeded()
             ensureValidSelection()
             requestTopScroll()
+            loadModelProxySettingsDraft()
         }
         .onDisappear {
             removeLocalKeyMonitor()
             removeLocalMouseMonitor()
+            modelProxyEndpointSaveTask?.cancel()
+            modelProxyEndpointSaveTask = nil
         }
         .onChange(of: navigableProfiles.map(\.stableID)) { _, ids in
             ensureValidSelection()
@@ -224,6 +221,22 @@ struct MenuBarRootView: View {
         }
         .onChange(of: model.profiles.map(\.stableID)) { _, _ in
             ensureValidSelection()
+        }
+        .onChange(of: model.modelProxyRuntimeModel) { _, _ in
+            if selectedMainTab == .proxy {
+                loadModelProxySettingsDraft()
+            }
+        }
+        .onChange(of: selectedMainTab) { _, nextTab in
+            if nextTab == .proxy {
+                loadModelProxySettingsDraft()
+            } else {
+                modelProxyEndpointSaveTask?.cancel()
+                modelProxyEndpointSaveTask = nil
+            }
+        }
+        .onChange(of: modelProxyPortText) { _, _ in
+            scheduleModelProxyEndpointSave()
         }
         .onChange(of: quickSwitchResults.map(\.stableID)) { _, ids in
             if ids.isEmpty {
@@ -255,7 +268,6 @@ struct MenuBarRootView: View {
         if deleteTarget != nil { return "delete" }
         if !bulkDeleteTargets.isEmpty { return "bulk-delete" }
         if switchTarget != nil { return "switch" }
-        if model.codexRelaunchPrompt != nil { return "relaunch" }
         return nil
     }
 
@@ -269,8 +281,6 @@ struct MenuBarRootView: View {
                 deleteTarget = nil
             } else if labelEditorTarget != nil {
                 labelEditorTarget = nil
-            } else if model.codexRelaunchPrompt != nil {
-                model.dismissCodexRelaunchPrompt()
             } else if showQuickSwitch {
                 showQuickSwitch = false
             } else if showSaveSheet {
@@ -291,18 +301,18 @@ struct MenuBarRootView: View {
                         .font(.system(.title3, design: .rounded, weight: .bold))
                         .foregroundStyle(palette.primaryText)
 
-                    RefreshActivityBadge(isRefreshing: model.isRefreshingProfiles)
+                    RefreshActivityBadge(isRefreshing: model.isRefreshButtonLoading)
                 }
             }
 
             Spacer()
 
             HStack(spacing: 8) {
-                RefreshButton(isRefreshing: model.isRefreshingProfiles) {
-                    Task { await model.refresh() }
+                RefreshButton(isRefreshing: model.isRefreshButtonLoading) {
+                    Task { await model.refreshFromUserAction() }
                 }
-                .disabled(model.isRefreshingProfiles)
-                .help(model.isRefreshingProfiles ? "Refreshing profiles…" : "Refresh profiles")
+                .disabled(model.isRefreshButtonLoading)
+                .help(model.isRefreshButtonLoading ? "Refreshing profiles…" : "Refresh profiles")
 
                 Button {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
@@ -351,6 +361,7 @@ struct MenuBarRootView: View {
                 }
                 .buttonStyle(IconButtonStyle())
                 .help("Exit app")
+
             }
         }
     }
@@ -358,9 +369,26 @@ struct MenuBarRootView: View {
     private var actionBar: some View {
         VStack(spacing: 10) {
             HStack(spacing: 10) {
+                ActionButton(
+                    title: model.isAddingProfile ? "Cancel" : "Add Profile",
+                    symbol: model.isAddingProfile ? "xmark.circle" : "person.badge.plus",
+                    prominence: model.isAddingProfile ? .destructive : .standard
+                ) {
+                    if model.isAddingProfile {
+                        model.cancelAddProfile()
+                    } else {
+                        Task { await model.addProfile() }
+                    }
+                }
+                .help(model.isAddingProfile ? "Cancel Codex login" : "Sign in with Codex and save a new profile")
+                .accessibilityLabel(model.isAddingProfile ? "Cancel adding profile" : "Add profile")
+                .disabled((model.isLoading && !model.isAddingProfile) || isPreparingImportPreview || isExportingAll)
+
                 ActionButton(title: "Save Current", symbol: "square.and.arrow.down") {
                     showSaveSheet = true
                 }
+                .help("Save the current Codex auth as a profile")
+                .accessibilityLabel("Save current profile")
                 .disabled(model.isLoading)
 
                 ActionButton(
@@ -368,76 +396,143 @@ struct MenuBarRootView: View {
                     symbol: "square.and.arrow.down.on.square",
                     isLoading: isPreparingImportPreview
                 ) {
-                    guard let url = presentImportPanel() else { return }
-                    isPreparingImportPreview = true
-                    Task {
-                        let preview = await model.previewImportBundle(from: url)
-                        await MainActor.run {
-                            isPreparingImportPreview = false
-                            guard let preview else { return }
-                            model.presentImportPreview(sourceURL: url, payload: preview)
-                            openImportPreviewWindow()
-                        }
-                    }
+                    startImportPreview()
                 }
+                .help("Preview and import profiles from a JSON bundle")
+                .accessibilityLabel("Import profiles")
                 .disabled(model.isLoading || isPreparingImportPreview || isExportingAll)
 
-                ActionButton(title: isExportingAll ? "Exporting…" : "Export All", symbol: "square.and.arrow.up", isLoading: isExportingAll) {
-                    Task {
-                        if let url = presentSavePanel(suggestedName: "codex-profile-bundle.json") {
-                            isExportingAll = true
-                            _ = await model.exportProfiles(
-                                ids: model.savedProfiles.compactMap(\.id),
-                                to: url,
-                                descriptor: "all saved profiles"
-                            )
-                            isExportingAll = false
-                        }
+                Menu {
+                    Button {
+                        startExportAll()
+                    } label: {
+                        Label(isExportingAll ? "Exporting…" : "Export All", systemImage: "square.and.arrow.up")
                     }
-                }
-                .disabled(model.savedProfiles.isEmpty || model.isLoading || isPreparingImportPreview || isExportingAll)
+                    .disabled(model.savedProfiles.isEmpty || model.isLoading || isPreparingImportPreview || isExportingAll)
 
-                ActionButton(title: "Doctor", symbol: "stethoscope") {
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
-                        showDoctorSheet = true
+                    Button {
+                        openDoctorSheet()
+                    } label: {
+                        Label("Doctor", systemImage: "stethoscope")
                     }
-                    Task { await model.loadDoctorReport() }
+                    .disabled(model.isLoading || isPreparingImportPreview || isExportingAll)
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: isExportingAll ? "arrow.clockwise" : "ellipsis.circle")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("More")
+                            .font(.system(.caption, design: .rounded, weight: .bold))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 18)
                 }
-                .disabled(model.isLoading || isPreparingImportPreview || isExportingAll)
+                .menuStyle(.button)
+                .buttonStyle(ActionPillButtonStyle())
+                .help("More profile actions")
+                .accessibilityLabel("More profile actions")
+                .disabled((model.isLoading && !isExportingAll) || isPreparingImportPreview)
             }
 
-            HStack(spacing: 10) {
-                SearchField(text: $searchText, palette: palette)
-                filterCountBadge
-                Button {
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
-                        bulkSelectionMode.toggle()
+            if selectedMainTab == .profiles {
+                HStack(spacing: 10) {
+                    SearchField(text: $searchText, palette: palette)
+                    filterCountBadge
+                    Button {
+                        withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                            bulkSelectionMode.toggle()
+                        }
+                        if !bulkSelectionMode {
+                            bulkSelectedProfileIDs.removeAll()
+                        }
+                    } label: {
+                        Text(bulkSelectionMode ? "Done" : "Select")
+                            .font(.system(.caption, design: .rounded, weight: .bold))
+                            .foregroundStyle(bulkSelectionMode ? Color.white : palette.primaryText)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(
+                                Capsule()
+                                    .fill(bulkSelectionMode ? palette.accent : palette.subtleFill)
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(bulkSelectionMode ? palette.accent.opacity(0.4) : palette.cardStroke, lineWidth: 1)
+                                    )
+                            )
                     }
-                    if !bulkSelectionMode {
-                        bulkSelectedProfileIDs.removeAll()
-                    }
-                } label: {
-                    Text(bulkSelectionMode ? "Done" : "Select")
-                        .font(.system(.caption, design: .rounded, weight: .bold))
-                        .foregroundStyle(bulkSelectionMode ? Color.white : palette.primaryText)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            Capsule()
-                                .fill(bulkSelectionMode ? palette.accent : palette.subtleFill)
-                                .overlay(
-                                    Capsule()
-                                        .stroke(bulkSelectionMode ? palette.accent.opacity(0.4) : palette.cardStroke, lineWidth: 1)
-                                )
-                        )
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
+            } else {
+                HStack(spacing: 10) {
+                    ProxyStatusBadge(state: model.modelProxyState)
+                    Text(model.modelProxyState.isCodexConfigured ? "Codex is routed through the local provider." : "Codex is not using the local provider.")
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(palette.secondaryText)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(palette.subtleFill)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(palette.cardStroke, lineWidth: 1)
+                        )
+                )
+            }
+        }
+    }
+
+    private func startImportPreview() {
+        guard let url = presentImportPanel() else { return }
+        isPreparingImportPreview = true
+        Task {
+            let preview = await model.previewImportBundle(from: url)
+            await MainActor.run {
+                isPreparingImportPreview = false
+                guard let preview else { return }
+                model.presentImportPreview(sourceURL: url, payload: preview)
+                openImportPreviewWindow()
+            }
+        }
+    }
+
+    private func startExportAll() {
+        Task {
+            if let url = presentSavePanel(suggestedName: "codex-profile-bundle.json") {
+                isExportingAll = true
+                _ = await model.exportProfiles(
+                    ids: model.savedProfiles.compactMap(\.id),
+                    to: url,
+                    descriptor: "all saved profiles"
+                )
+                isExportingAll = false
+            }
+        }
+    }
+
+    private func openDoctorSheet() {
+        withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+            showDoctorSheet = true
+        }
+        Task { await model.loadDoctorReport() }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        VStack(spacing: 0) {
+            mainTabBar
+
+            if selectedMainTab == .profiles {
+                profilesContent
+            } else {
+                proxyContent
             }
         }
     }
 
     @ViewBuilder
-    private var content: some View {
+    private var profilesContent: some View {
         if model.isLoading && model.profiles.isEmpty {
             Spacer()
             ProgressView("Loading profiles…")
@@ -470,12 +565,8 @@ struct MenuBarRootView: View {
                                     sparklineValues: model.usageHistoryByProfileID[currentProfile.id ?? ""]?.sparklinePercentages ?? [],
                                     healthBadges: healthBadges(for: currentProfile),
                                     recommendation: model.recommendedSwitch,
-                                    isRestartingCodex: model.isRestartingCodex,
                                     onToggleFavorite: {
                                         model.toggleFavorite(currentProfile)
-                                    },
-                                    onReopen: {
-                                        Task { _ = await model.restartCodex() }
                                     },
                                     onSwitchRecommended: {
                                         guard let recommendation = model.recommendedSwitch,
@@ -502,13 +593,13 @@ struct MenuBarRootView: View {
 
                             if let lastRefresh = model.lastRefresh {
                                 HStack {
-                                    Text(model.isRefreshingProfiles ? "Refreshing profiles…" : "Updated \(lastRefresh.formatted(date: .omitted, time: .shortened))")
+                                    Text(model.isRefreshButtonLoading ? "Refreshing profiles…" : "Updated \(lastRefresh.formatted(date: .omitted, time: .shortened))")
                                         .font(.system(.caption, design: .monospaced))
-                                        .foregroundStyle(model.isRefreshingProfiles ? palette.success : palette.tertiaryText)
+                                        .foregroundStyle(model.isRefreshButtonLoading ? palette.success : palette.tertiaryText)
                                         .contentTransition(.opacity)
                                     Spacer()
                                 }
-                            } else if model.isRefreshingProfiles {
+                            } else if model.isRefreshButtonLoading {
                                 HStack {
                                     Text("Refreshing profiles…")
                                         .font(.system(.caption, design: .monospaced))
@@ -658,6 +749,58 @@ struct MenuBarRootView: View {
     private func requestTopScroll() {
         isTopScrollPending = true
         pendingTopScrollRequest += 1
+    }
+
+    private func loadModelProxySettingsDraft() {
+        let storedPort = UserDefaults.standard.integer(forKey: Preferences.modelProxyPortKey)
+        let port = (1...65_535).contains(storedPort) ? storedPort : ModelProxyState.defaultPort
+        modelProxyPortText = "\(port)"
+
+        if let contextWindow = model.modelProxyRuntimeModel.contextWindow {
+            modelContextWindowText = "\(contextWindow)"
+        } else {
+            modelContextWindowText = ""
+        }
+
+        if let contextWindow = model.modelProxyRuntimeModel.contextWindow,
+           let tokenLimit = model.modelProxyRuntimeModel.autoCompactTokenLimit,
+           contextWindow > 0 {
+            let percent = Int((Double(tokenLimit) / Double(contextWindow) * 100.0).rounded())
+            modelTokenLimitPercentText = "\(max(1, min(percent, 100)))"
+        } else {
+            modelTokenLimitPercentText = ""
+        }
+    }
+
+    private func scheduleModelProxyEndpointSave() {
+        modelProxyEndpointSaveTask?.cancel()
+        let trimmedPort = modelProxyPortText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard selectedMainTab == .proxy,
+              !trimmedPort.isEmpty,
+              trimmedPort != "\(model.modelProxyState.port)" else {
+            modelProxyEndpointSaveTask = nil
+            return
+        }
+
+        modelProxyEndpointSaveTask = Task {
+            try? await Task.sleep(for: .milliseconds(650))
+            guard !Task.isCancelled else { return }
+            _ = await model.saveModelProxySettings(
+                portText: trimmedPort,
+                upstreamText: ModelProxyState.defaultUpstreamBaseURL
+            )
+        }
+    }
+
+    private func saveModelProxyEndpointNow() {
+        modelProxyEndpointSaveTask?.cancel()
+        modelProxyEndpointSaveTask = nil
+        Task {
+            _ = await model.saveModelProxySettings(
+                portText: modelProxyPortText,
+                upstreamText: ModelProxyState.defaultUpstreamBaseURL
+            )
+        }
     }
 
     private func presentSavePanel(suggestedName: String) -> URL? {
@@ -1160,24 +1303,96 @@ struct MenuBarRootView: View {
         .animation(.spring(response: 0.3, dampingFraction: 0.84), value: selectedFilter)
     }
 
+    private var mainTabBar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                ForEach(MainPanelTab.allCases) { tab in
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            selectedMainTab = tab
+                        }
+                        if tab == .profiles {
+                            requestTopScroll()
+                        } else if tab == .proxy {
+                            loadModelProxySettingsDraft()
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: tab.symbol)
+                                .font(.system(size: 12, weight: .bold))
+                            Text(tab.title)
+                                .font(.system(.caption, design: .rounded, weight: .bold))
+                        }
+                        .foregroundStyle(selectedMainTab == tab ? Color.white : palette.secondaryText)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .frame(minWidth: 90)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(
+                                    selectedMainTab == tab
+                                        ? LinearGradient(
+                                            colors: [palette.accent, palette.accentSecondary],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                        : LinearGradient(
+                                            colors: [palette.subtleFill, palette.subtleFill.opacity(0.72)],
+                                            startPoint: .top,
+                                            endPoint: .bottom
+                                        )
+                                )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(selectedMainTab == tab ? palette.cardStroke.opacity(1.4) : palette.cardStroke, lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .scaleEffect(selectedMainTab == tab ? 1.0 : 0.985)
+                }
+            }
+            .padding(6)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(palette.chipFill)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(palette.chipStroke, lineWidth: 1)
+                    )
+            )
+
+            Spacer(minLength: 0)
+        }
+        .padding(.bottom, 8)
+        .animation(.spring(response: 0.3, dampingFraction: 0.84), value: selectedMainTab)
+    }
+
+    private var proxyContent: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                proxyDashboardCard
+            }
+            .padding(.bottom, 8)
+        }
+        .scrollIndicators(.hidden)
+    }
+
     private var filterBarHeader: some View {
         filterBar
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.bottom, 8)
-            .background(
-                LinearGradient(
-                    colors: [palette.backgroundStart, palette.backgroundEnd],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            )
     }
 
     private var filterCountBadge: some View {
-        Text("\(filteredProfiles.count)")
-            .font(.system(.caption, design: .monospaced, weight: .bold))
+        HStack(spacing: 6) {
+            Image(systemName: "rectangle.stack")
+                .font(.system(size: 11, weight: .semibold))
+            Text("\(filteredProfiles.count) profiles")
+                .font(.system(.caption, design: .rounded, weight: .bold))
+        }
             .foregroundStyle(palette.primaryText.opacity(0.88))
-            .padding(.horizontal, 11)
+            .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(
                 Capsule()
@@ -1187,10 +1402,229 @@ struct MenuBarRootView: View {
                             .stroke(palette.cardStroke, lineWidth: 1)
                     )
             )
+            .accessibilityLabel("\(filteredProfiles.count) filtered profiles")
+    }
+
+    private var proxyDashboardCard: some View {
+        SettingsCard(
+            eyebrow: "Proxy",
+            title: "Local Model Proxy",
+            detail: "Route Codex through a local proxy that uses the active profile."
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Run local proxy")
+                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+                        Text("Use the active profile for Codex requests.")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+
+                    Spacer()
+
+                    Toggle(
+                        isOn: Binding(
+                            get: { model.modelProxyState.isEnabled },
+                            set: { enabled in
+                                Task { await model.setModelProxyEnabled(enabled) }
+                            }
+                        )
+                    ) {
+                        EmptyView()
+                    }
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+
+                    ProxyStatusBadge(state: model.modelProxyState)
+
+                    if model.modelProxyState.isEnabled {
+                        Button {
+                            Task { await model.restartModelProxy() }
+                        } label: {
+                            Label("Restart", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+
+                }
+
+                if let error = model.modelProxyState.lastError {
+                    Text(error)
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(Color(red: 0.82, green: 0.24, blue: 0.24))
+                }
+
+                if model.modelProxyState.requiresCodexRelaunch {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Codex reopen required")
+                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+                        Text("The provider routing changed. Reopen Codex once so new chats bind to the current proxy state.")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(palette.secondaryText)
+
+                        Button(action: {
+                            Task { _ = await model.restartCodex() }
+                        }) {
+                            HStack(spacing: 8) {
+                                if model.isRestartingCodex {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .tint(.white)
+                                } else {
+                                    Image(systemName: "arrow.clockwise.circle.fill")
+                                }
+                                Text(model.isRestartingCodex ? "Reopening…" : "Reopen Codex")
+                                    .font(.system(.caption, design: .rounded, weight: .bold))
+                            }
+                        }
+                        .buttonStyle(SwitchButtonStyle(isActive: model.isRestartingCodex))
+                        .disabled(model.isRestartingCodex)
+                    }
+                    .padding(12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(palette.subtleFill)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .stroke(palette.cardStroke, lineWidth: 1)
+                            )
+                    )
+                }
+
+                proxySettingsSection(
+                    title: "Endpoint settings",
+                    systemImage: "network",
+                    description: "This port creates the local Codex endpoint."
+                ) {
+                    HStack(alignment: .top, spacing: 10) {
+                        proxyField(title: "Local port", placeholder: "20128", text: $modelProxyPortText, width: 132)
+                            .onSubmit {
+                                saveModelProxyEndpointNow()
+                            }
+                    }
+                }
+
+                proxySettingsSection(
+                    title: "Model limits",
+                    systemImage: "dial.high",
+                    description: "Context window sets the token budget. Auto-compact starts when usage reaches that percent."
+                ) {
+                    HStack(alignment: .top, spacing: 10) {
+                        proxyField(title: "Context window", placeholder: "400000", text: $modelContextWindowText)
+                        proxyField(title: "Auto-compact %", placeholder: "95", text: $modelTokenLimitPercentText, width: 120)
+                    }
+
+                    HStack(spacing: 8) {
+                        proxyMetric("Model", value: model.modelProxyRuntimeModel.name, systemImage: "cpu")
+                        if let contextWindow = model.modelProxyRuntimeModel.contextWindow,
+                           let tokenLimit = model.modelProxyRuntimeModel.autoCompactTokenLimit {
+                            proxyMetric("Threshold", value: "\(tokenLimit.formatted()) / \(contextWindow.formatted())", systemImage: "target")
+                        }
+                    }
+
+                    HStack {
+                        Spacer(minLength: 0)
+
+                        Button {
+                            Task {
+                                let didSave = await model.saveModelProxyRuntimeSettings(
+                                    contextWindowText: modelContextWindowText,
+                                    tokenLimitPercentText: modelTokenLimitPercentText
+                                )
+                                if didSave {
+                                    loadModelProxySettingsDraft()
+                                }
+                            }
+                        } label: {
+                            Label("Save limits", systemImage: "dial.high")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+        }
+    }
+
+    private func proxySettingsSection<Content: View>(
+        title: String,
+        systemImage: String,
+        description: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(title, systemImage: systemImage)
+                .font(.system(.subheadline, design: .rounded, weight: .bold))
+                .foregroundStyle(palette.primaryText)
+
+            Text(description)
+                .font(.system(.caption, design: .rounded))
+                .foregroundStyle(palette.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            content()
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(palette.subtleFill.opacity(0.85))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(palette.cardStroke, lineWidth: 1)
+                )
+        )
+    }
+
+    private func proxyField(
+        title: String,
+        placeholder: String,
+        text: Binding<String>,
+        width: CGFloat? = nil
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.system(.caption2, design: .rounded, weight: .bold))
+                .foregroundStyle(palette.secondaryText)
+
+            TextField(placeholder, text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.callout, design: .monospaced))
+                .frame(width: width)
+        }
+        .frame(maxWidth: width == nil ? .infinity : width, alignment: .leading)
+    }
+
+    private func proxyMetric(_ label: String, value: String, systemImage: String) -> some View {
+        Label {
+            HStack(spacing: 5) {
+                Text(label)
+                    .font(.system(.caption2, design: .rounded, weight: .bold))
+                    .foregroundStyle(palette.secondaryText)
+                Text(value)
+                    .font(.system(.caption, design: .monospaced, weight: .semibold))
+                    .foregroundStyle(palette.primaryText)
+                    .lineLimit(1)
+            }
+        } icon: {
+            Image(systemName: systemImage)
+                .font(.system(.caption, weight: .semibold))
+                .foregroundStyle(palette.accent)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(palette.cardFill.opacity(0.7), in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(palette.cardStroke, lineWidth: 1)
+        )
     }
 
     private var bulkActionBar: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("\(selectedBulkProfiles.count) selected")
@@ -1602,9 +2036,7 @@ struct ActiveProfileSpotlightCard: View {
     let sparklineValues: [Int]
     let healthBadges: [ProfileHealthBadgeDescriptor]
     let recommendation: ProfileSwitchRecommendation?
-    let isRestartingCodex: Bool
     let onToggleFavorite: () -> Void
-    let onReopen: () -> Void
     let onSwitchRecommended: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
@@ -1725,25 +2157,6 @@ struct ActiveProfileSpotlightCard: View {
                         )
                 )
             }
-
-            HStack(spacing: 10) {
-                Button(action: onReopen) {
-                    HStack(spacing: 8) {
-                        if isRestartingCodex {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(.white)
-                        } else {
-                            Image(systemName: "arrow.clockwise.circle.fill")
-                        }
-                        Text(isRestartingCodex ? "Reopening…" : "Reopen Codex")
-                            .font(.system(.caption, design: .rounded, weight: .bold))
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(SwitchButtonStyle(isActive: isRestartingCodex))
-                .disabled(isRestartingCodex)
-            }
         }
         .padding(16)
         .background(
@@ -1793,6 +2206,7 @@ struct SearchField: View {
                         .stroke(palette.cardStroke, lineWidth: 1)
                 )
         )
+        .accessibilityLabel("Search profiles")
     }
 
     @ViewBuilder
@@ -1865,7 +2279,7 @@ struct AggregateUsageCard: View {
                 .foregroundStyle(tint)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+        .padding(14)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.subtleFill)
@@ -2640,57 +3054,6 @@ struct UnsavedSwitchOverlay: View {
     }
 }
 
-struct CodexRelaunchOverlay: View {
-    @ObservedObject var model: CodexProfilesViewModel
-    let prompt: CodexRelaunchPrompt
-    let onClose: () -> Void
-
-    var body: some View {
-        OverlayCard {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Reopen Codex now?")
-                    .font(.system(.title3, design: .rounded, weight: .bold))
-
-                Text("The profile has been switched to \(prompt.profileName). Reopening Codex will make the new profile available right away.")
-                    .foregroundStyle(.secondary)
-
-                HStack(spacing: 10) {
-                    Button("Later") {
-                        onClose()
-                    }
-                    .disabled(model.isRestartingCodex)
-
-                    Spacer()
-
-                    Button(action: {
-                        Task {
-                            let didRestart = await model.restartCodex()
-                            await MainActor.run {
-                                if didRestart {
-                                    onClose()
-                                }
-                            }
-                        }
-                    }) {
-                        HStack(spacing: 8) {
-                            if model.isRestartingCodex {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .tint(.white)
-                            }
-                            Text(model.isRestartingCodex ? "Reopening…" : "Reopen Codex")
-                        }
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(model.isRestartingCodex)
-                }
-                .animation(.easeInOut(duration: 0.18), value: model.isRestartingCodex)
-            }
-            .frame(width: 356)
-        }
-    }
-}
-
 struct OverlayCard<Content: View>: View {
     @ViewBuilder let content: Content
 
@@ -3014,6 +3377,31 @@ struct FlowLayout: Layout {
     }
 }
 
+private enum MainPanelTab: String, CaseIterable, Identifiable {
+    case profiles
+    case proxy
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .profiles:
+            return "Profiles"
+        case .proxy:
+            return "Proxy"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .profiles:
+            return "person.2.fill"
+        case .proxy:
+            return "point.3.connected.trianglepath.dotted"
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: CodexProfilesViewModel
     let resolvedColorScheme: ColorScheme
@@ -3021,7 +3409,7 @@ struct SettingsView: View {
     var onClose: (() -> Void)?
     @AppStorage(Preferences.showIDsKey) private var showIDs = false
     @AppStorage(Preferences.autoRefreshKey) private var autoRefreshEnabled = true
-    @AppStorage(Preferences.promptReopenCodexKey) private var promptReopenCodex = true
+    @AppStorage(Preferences.autoRefreshIntervalKey) private var autoRefreshInterval = UsageRefreshIntervalOption.default.rawValue
     @AppStorage(Preferences.panelThemeKey) private var panelTheme = PanelTheme.system.rawValue
     @AppStorage(Preferences.compactModeKey) private var compactMode = false
     @AppStorage(Preferences.groupingKey) private var grouping = ProfileGrouping.none.rawValue
@@ -3073,6 +3461,10 @@ struct SettingsView: View {
             get: { AccentTheme.cgColor() },
             set: { AccentTheme.save($0) }
         )
+    }
+
+    private var selectedRefreshInterval: UsageRefreshIntervalOption {
+        UsageRefreshIntervalOption(rawValue: autoRefreshInterval) ?? .default
     }
 
     var body: some View {
@@ -3201,7 +3593,7 @@ struct SettingsView: View {
                 }
                 .toggleStyle(.switch)
 
-                VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .center, spacing: 14) {
                     Text("Panel theme")
                         .font(.system(.headline, design: .rounded, weight: .semibold))
                         .foregroundStyle(palette.primaryText)
@@ -3210,10 +3602,11 @@ struct SettingsView: View {
                             Text(theme.title).tag(theme.rawValue)
                         }
                     }
+                    .labelsHidden()
                     .pickerStyle(.segmented)
                 }
 
-                VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .center, spacing: 14) {
                     Text("Accent color")
                         .font(.system(.headline, design: .rounded, weight: .semibold))
                         .foregroundStyle(palette.primaryText)
@@ -3226,7 +3619,7 @@ struct SettingsView: View {
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .center, spacing: 14) {
                     Text("Grouping")
                         .font(.system(.headline, design: .rounded, weight: .semibold))
                         .foregroundStyle(palette.primaryText)
@@ -3235,6 +3628,7 @@ struct SettingsView: View {
                             Text(group.title).tag(group.rawValue)
                         }
                     }
+                    .labelsHidden()
                     .pickerStyle(.segmented)
                 }
 
@@ -3260,27 +3654,37 @@ struct SettingsView: View {
                     )
                 ) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Refresh usage automatically every minute")
+                        Text("Auto refresh all profiles")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("Keeps usage and status fresh while the app is running.")
-                            .font(.system(.caption, design: .rounded))
-                            .foregroundStyle(palette.secondaryText)
                     }
                 }
                 .toggleStyle(.switch)
 
-                Toggle(isOn: $promptReopenCodex) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Ask to reopen Codex after switching")
+                if autoRefreshEnabled {
+                    HStack(alignment: .center, spacing: 14) {
+                        Text("Refresh duration")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("Shows a prompt after profile switches so the new session can be used right away.")
-                            .font(.system(.caption, design: .rounded))
-                            .foregroundStyle(palette.secondaryText)
+                        Picker(
+                            "Refresh duration",
+                            selection: Binding(
+                                get: { selectedRefreshInterval.rawValue },
+                                set: { seconds in
+                                    autoRefreshInterval = seconds
+                                    model.setAutoRefreshInterval(seconds)
+                                }
+                            )
+                        ) {
+                            ForEach(UsageRefreshIntervalOption.allCases) { option in
+                                Text(option.shortTitle).tag(option.rawValue)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
                     }
                 }
-                .toggleStyle(.switch)
+
             }
         }
     }
@@ -3465,6 +3869,49 @@ struct StartupStatusBadge: View {
     }
 }
 
+struct ProxyStatusBadge: View {
+    let state: ModelProxyState
+
+    var body: some View {
+        Text(title)
+            .font(.system(.caption, design: .rounded, weight: .bold))
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(background, in: Capsule())
+    }
+
+    private var title: String {
+        if state.isRunning {
+            return "Running"
+        }
+        if state.isEnabled {
+            return "Error"
+        }
+        return "Off"
+    }
+
+    private var foreground: Color {
+        if state.isRunning {
+            return Color(red: 0.10, green: 0.54, blue: 0.29)
+        }
+        if state.isEnabled {
+            return Color(red: 0.63, green: 0.26, blue: 0.26)
+        }
+        return Color(red: 0.28, green: 0.35, blue: 0.49)
+    }
+
+    private var background: Color {
+        if state.isRunning {
+            return Color.green.opacity(0.14)
+        }
+        if state.isEnabled {
+            return Color.red.opacity(0.12)
+        }
+        return Color.gray.opacity(0.15)
+    }
+}
+
 struct LabeledSettingRow: View {
     let label: String
     let value: String
@@ -3564,9 +4011,16 @@ struct UsageMeterRow: View {
     }
 }
 
+enum ActionButtonProminence {
+    case standard
+    case primary
+    case destructive
+}
+
 struct ActionButton: View {
     let title: String
     let symbol: String
+    var prominence: ActionButtonProminence = .standard
     var isLoading = false
     let action: () -> Void
 
@@ -3583,11 +4037,11 @@ struct ActionButton: View {
                 Text(title)
                     .font(.system(.caption, design: .rounded, weight: .bold))
                     .lineLimit(1)
-                    .minimumScaleFactor(0.82)
+                    .minimumScaleFactor(0.9)
             }
             .frame(maxWidth: .infinity, minHeight: 18)
         }
-        .buttonStyle(ActionPillButtonStyle())
+        .buttonStyle(ActionPillButtonStyle(prominence: prominence))
     }
 }
 
@@ -3773,6 +4227,7 @@ struct DoctorSummaryView: View {
 }
 
 struct ActionPillButtonStyle: ButtonStyle {
+    var prominence: ActionButtonProminence = .standard
     @Environment(\.colorScheme) private var colorScheme
 
     func makeBody(configuration: Configuration) -> some View {
@@ -3780,16 +4235,56 @@ struct ActionPillButtonStyle: ButtonStyle {
         configuration.label
             .padding(.horizontal, 10)
             .padding(.vertical, 10)
-            .foregroundStyle(palette.primaryText)
+            .foregroundStyle(foregroundColor(palette: palette))
             .frame(maxWidth: .infinity, minHeight: 44)
             .background(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(configuration.isPressed ? palette.subtleFill.opacity(1.4) : palette.subtleFill)
+                    .fill(backgroundStyle(palette: palette, isPressed: configuration.isPressed))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(palette.cardStroke, lineWidth: 1)
+                    .stroke(strokeColor(palette: palette), lineWidth: 1)
             )
+    }
+
+    private func foregroundColor(palette: PanelPalette) -> Color {
+        switch prominence {
+        case .standard:
+            return palette.primaryText
+        case .primary:
+            return .white
+        case .destructive:
+            return palette.warning
+        }
+    }
+
+    private func backgroundStyle(palette: PanelPalette, isPressed: Bool) -> AnyShapeStyle {
+        switch prominence {
+        case .standard:
+            return AnyShapeStyle(isPressed ? palette.subtleFill.opacity(1.4) : palette.subtleFill)
+        case .primary:
+            let opacity = isPressed ? 0.86 : 1.0
+            return AnyShapeStyle(
+                LinearGradient(
+                    colors: [palette.accent.opacity(opacity), palette.accentSecondary.opacity(opacity)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+        case .destructive:
+            return AnyShapeStyle(isPressed ? palette.warning.opacity(0.2) : palette.warning.opacity(0.12))
+        }
+    }
+
+    private func strokeColor(palette: PanelPalette) -> Color {
+        switch prominence {
+        case .standard:
+            return palette.cardStroke
+        case .primary:
+            return palette.accent.opacity(0.6)
+        case .destructive:
+            return palette.warning.opacity(0.45)
+        }
     }
 }
 

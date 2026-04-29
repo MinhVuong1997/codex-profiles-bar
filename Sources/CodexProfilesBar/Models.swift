@@ -3,7 +3,7 @@ import Foundation
 enum Preferences {
     static let showIDsKey = "CodexProfilesBar.showIDs"
     static let autoRefreshKey = "CodexProfilesBar.autoRefresh"
-    static let promptReopenCodexKey = "CodexProfilesBar.promptReopenCodex"
+    static let autoRefreshIntervalKey = "CodexProfilesBar.autoRefreshInterval"
     static let panelThemeKey = "CodexProfilesBar.panelTheme"
     static let compactModeKey = "CodexProfilesBar.compactMode"
     static let groupingKey = "CodexProfilesBar.grouping"
@@ -16,6 +16,11 @@ enum Preferences {
     static let accentGreenKey = "CodexProfilesBar.accentGreen"
     static let accentBlueKey = "CodexProfilesBar.accentBlue"
     static let notificationInboxKey = "CodexProfilesBar.notificationInbox"
+    static let modelProxyEnabledKey = "CodexProfilesBar.modelProxy.enabled"
+    static let modelProxyPortKey = "CodexProfilesBar.modelProxy.port"
+    static let modelProxyUpstreamKey = "CodexProfilesBar.modelProxy.upstream"
+    static let modelProxyPreviousChatGPTBaseURLKey = "CodexProfilesBar.modelProxy.previousChatGPTBaseURL"
+    static let modelProxyPreviousModelProviderKey = "CodexProfilesBar.modelProxy.previousModelProvider"
 }
 
 enum ProfileFilter: String, CaseIterable, Identifiable {
@@ -49,6 +54,43 @@ enum ProfileGrouping: String, CaseIterable, Identifiable {
             "Flat"
         case .plan:
             "Plan"
+        }
+    }
+}
+
+enum UsageRefreshIntervalOption: Int, CaseIterable, Identifiable {
+    case oneMinute = 60
+    case twoMinutes = 120
+    case fiveMinutes = 300
+    case tenMinutes = 600
+
+    static let `default` = oneMinute
+
+    var id: Int { rawValue }
+
+    var shortTitle: String {
+        switch self {
+        case .oneMinute:
+            "1m"
+        case .twoMinutes:
+            "2m"
+        case .fiveMinutes:
+            "5m"
+        case .tenMinutes:
+            "10m"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .oneMinute:
+            "1 minute"
+        case .twoMinutes:
+            "2 minutes"
+        case .fiveMinutes:
+            "5 minutes"
+        case .tenMinutes:
+            "10 minutes"
         }
     }
 }
@@ -214,7 +256,7 @@ struct ProfileStatus: Decodable, Hashable, Identifiable {
 
     var hasRemainingUsage: Bool {
         usage?.buckets.contains(where: { bucket in
-            (bucket.fiveHour?.leftPercent ?? 0) > 0 || (bucket.weekly?.leftPercent ?? 0) > 0
+            (bucket.effectiveRemainingPercent ?? 0) > 0
         }) == true
     }
 }
@@ -584,9 +626,53 @@ struct ProfileSwitchRecommendation: Equatable {
     let reason: String
 }
 
-struct CodexRelaunchPrompt: Identifiable, Equatable {
-    let id = UUID()
+struct ModelProxyState: Equatable {
+    var isEnabled: Bool
+    var isRunning: Bool
+    var endpoint: String
+    var codexBaseURL: String
+    var port: Int
+    var upstreamBaseURL: String
+    var activeProfileName: String?
+    var isCodexConfigured: Bool
+    var requiresCodexRelaunch: Bool
+    var lastError: String?
+
+    static let defaultPort = 20128
+    static let defaultUpstreamBaseURL = "https://chatgpt.com/backend-api"
+
+    static var disabled: ModelProxyState {
+        ModelProxyState(
+            isEnabled: false,
+            isRunning: false,
+            endpoint: "http://127.0.0.1:\(defaultPort)/v1",
+            codexBaseURL: "http://127.0.0.1:\(defaultPort)/v1",
+            port: defaultPort,
+            upstreamBaseURL: defaultUpstreamBaseURL,
+            activeProfileName: nil,
+            isCodexConfigured: false,
+            requiresCodexRelaunch: false,
+            lastError: nil
+        )
+    }
+}
+
+struct ModelProxyCredential: Sendable {
+    enum Kind: String, Sendable {
+        case apiKey
+        case codexSession
+    }
+
+    let kind: Kind
+    let authorizationValue: String
+    let accountID: String?
     let profileName: String
+}
+
+struct ModelProxyRuntimeModel: Sendable, Equatable {
+    let name: String
+    let contextWindow: Int?
+    let autoCompactTokenLimit: Int?
 }
 
 enum SwitchMode {

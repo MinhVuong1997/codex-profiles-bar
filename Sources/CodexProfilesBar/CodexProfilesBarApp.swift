@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        NotificationCenter.default.post(name: .codexProfilesBarWillTerminate, object: nil)
         if let globalKeyMonitor {
             NSEvent.removeMonitor(globalKeyMonitor)
         }
@@ -115,7 +116,7 @@ struct CodexProfilesBarApp: App {
             SettingsView(model: model, resolvedColorScheme: resolvedColorScheme)
                 .preferredColorScheme(resolvedColorScheme)
                 .background(WindowAppearanceConfigurator(appearance: resolvedAppearance))
-                .frame(width: 640, height: 460)
+                .frame(width: 680, height: 560)
         }
 
         Window("Profiles Panel", id: "profiles-panel") {
@@ -144,6 +145,9 @@ private extension NSEvent {
 extension Notification.Name {
     static let cycleProfilesShortcut = Notification.Name("CodexProfilesBar.cycleProfilesShortcut")
     static let reopenCodexFromNotification = Notification.Name("CodexProfilesBar.reopenCodexFromNotification")
+    static let modelProxyDidHitUsageLimit = Notification.Name("CodexProfilesBar.modelProxyDidHitUsageLimit")
+    static let modelProxyDidCompleteRequest = Notification.Name("CodexProfilesBar.modelProxyDidCompleteRequest")
+    static let codexProfilesBarWillTerminate = Notification.Name("CodexProfilesBar.willTerminate")
 }
 
 enum NotificationCategoryIdentifier {
