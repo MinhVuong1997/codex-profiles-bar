@@ -638,7 +638,7 @@ struct ModelProxyState: Equatable {
     var requiresCodexRelaunch: Bool
     var lastError: String?
 
-    static let defaultPort = 20128
+    static let defaultPort = 20263
     static let defaultUpstreamBaseURL = "https://chatgpt.com/backend-api"
 
     static var disabled: ModelProxyState {

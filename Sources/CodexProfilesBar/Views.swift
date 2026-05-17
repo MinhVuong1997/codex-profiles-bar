@@ -318,7 +318,6 @@ struct MenuBarRootView: View {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
                         showInboxSheet = true
                     }
-                    model.markAllInboxItemsRead()
                 } label: {
                     ZStack(alignment: .topTrailing) {
                         Image(systemName: model.unreadInboxCount > 0 ? "bell.badge.fill" : "bell")
@@ -1501,7 +1500,7 @@ struct MenuBarRootView: View {
                     description: "This port creates the local Codex endpoint."
                 ) {
                     HStack(alignment: .top, spacing: 10) {
-                        proxyField(title: "Local port", placeholder: "20128", text: $modelProxyPortText, width: 132)
+                        proxyField(title: "Local port", placeholder: "\(ModelProxyState.defaultPort)", text: $modelProxyPortText, width: 132)
                             .onSubmit {
                                 saveModelProxyEndpointNow()
                             }
