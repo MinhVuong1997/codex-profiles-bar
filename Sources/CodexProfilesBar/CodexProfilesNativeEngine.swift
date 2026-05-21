@@ -739,10 +739,12 @@ private extension CodexProfilesNativeEngine {
     }
 
     struct UsagePayload: Decodable {
+        let planType: String?
         let rateLimit: RateLimitDetails?
         let additionalRateLimits: [AdditionalRateLimitDetails]?
 
         enum CodingKeys: String, CodingKey {
+            case planType = "plan_type"
             case rateLimit = "rate_limit"
             case additionalRateLimits = "additional_rate_limits"
         }
@@ -1326,6 +1328,7 @@ private extension CodexProfilesNativeEngine {
         let isAPIKey = isAPIKeyProfile(tokens)
         var effectiveTokens = tokens
         var usage: UsageSnapshot?
+        var usagePlan: String?
         var error: StatusError?
 
         if isAPIKey {
@@ -1344,12 +1347,13 @@ private extension CodexProfilesNativeEngine {
             )
             effectiveTokens = usageOutcome.tokens
             usage = usageOutcome.usage
+            usagePlan = usageOutcome.plan
             error = usageOutcome.error
         }
 
         let extracted = extractEmailAndPlan(from: effectiveTokens)
         let email = extracted.0 ?? fallbackEmail
-        let plan = extracted.1 ?? fallbackPlan
+        let plan = usagePlan ?? extracted.1 ?? fallbackPlan
 
         if error == nil, let validationMessage = profileValidationMessage(
             tokens: effectiveTokens,
@@ -1377,6 +1381,7 @@ private extension CodexProfilesNativeEngine {
     struct UsageBuildOutcome {
         let tokens: NativeTokens
         let usage: UsageSnapshot?
+        let plan: String?
         let error: StatusError?
     }
 
@@ -1387,7 +1392,7 @@ private extension CodexProfilesNativeEngine {
         syncSavedIDOnRefresh: String?
     ) async -> UsageBuildOutcome {
         guard let accessToken = nonEmpty(tokens.accessToken), let accountID = tokenAccountID(tokens) else {
-            return UsageBuildOutcome(tokens: tokens, usage: nil, error: nil)
+            return UsageBuildOutcome(tokens: tokens, usage: nil, plan: nil, error: nil)
         }
 
         let baseURL: String
@@ -1398,13 +1403,14 @@ private extension CodexProfilesNativeEngine {
             return UsageBuildOutcome(
                 tokens: tokens,
                 usage: UsageSnapshot(state: "error", buckets: [], summary: usageSummary(from: message), detail: usageDetail(from: message)),
+                plan: nil,
                 error: StatusError(summary: StatusErrorSummary(message: validationSummary(for: message)), detail: message)
             )
         }
 
         do {
-            let buckets = try await fetchUsageSnapshot(baseURL: baseURL, accessToken: accessToken, accountID: accountID)
-            return UsageBuildOutcome(tokens: tokens, usage: UsageSnapshot(state: "ok", buckets: buckets), error: nil)
+            let snapshot = try await fetchUsageSnapshot(baseURL: baseURL, accessToken: accessToken, accountID: accountID)
+            return UsageBuildOutcome(tokens: tokens, usage: UsageSnapshot(state: "ok", buckets: snapshot.buckets), plan: snapshot.plan, error: nil)
         } catch let fetchError as UsageFetchError where fetchError.statusCode == 401 {
             do {
                 let refreshed = try await refreshProfileTokens(at: sourcePath, currentTokens: tokens)
@@ -1413,13 +1419,14 @@ private extension CodexProfilesNativeEngine {
                 }
                 let refreshedAccessToken = nonEmpty(refreshed.accessToken) ?? accessToken
                 let refreshedAccountID = tokenAccountID(refreshed) ?? accountID
-                let buckets = try await fetchUsageSnapshot(baseURL: baseURL, accessToken: refreshedAccessToken, accountID: refreshedAccountID)
-                return UsageBuildOutcome(tokens: refreshed, usage: UsageSnapshot(state: "ok", buckets: buckets), error: nil)
+                let snapshot = try await fetchUsageSnapshot(baseURL: baseURL, accessToken: refreshedAccessToken, accountID: refreshedAccountID)
+                return UsageBuildOutcome(tokens: refreshed, usage: UsageSnapshot(state: "ok", buckets: snapshot.buckets), plan: snapshot.plan, error: nil)
             } catch {
                 let message = error.localizedDescription
                 return UsageBuildOutcome(
                     tokens: tokens,
                     usage: UsageSnapshot(state: "error", buckets: [], summary: usageSummary(from: message), detail: usageDetail(from: message)),
+                    plan: nil,
                     error: StatusError(summary: StatusErrorSummary(message: validationSummary(for: message)), detail: message)
                 )
             }
@@ -1428,6 +1435,7 @@ private extension CodexProfilesNativeEngine {
             return UsageBuildOutcome(
                 tokens: tokens,
                 usage: UsageSnapshot(state: "error", buckets: [], summary: usageSummary(from: message), detail: usageDetail(from: message)),
+                plan: nil,
                 error: StatusError(summary: StatusErrorSummary(message: validationSummary(for: message)), detail: message)
             )
         }
@@ -2116,7 +2124,7 @@ private extension CodexProfilesNativeEngine {
         return URL(string: baseURL + "/api/codex/usage")!
     }
 
-    func fetchUsageSnapshot(baseURL: String, accessToken: String, accountID: String) async throws -> [UsageBucket] {
+    func fetchUsageSnapshot(baseURL: String, accessToken: String, accountID: String) async throws -> (plan: String?, buckets: [UsageBucket]) {
         let endpoint = usageEndpoint(baseURL: baseURL)
         var lastError: UsageFetchError?
 
@@ -2148,7 +2156,7 @@ private extension CodexProfilesNativeEngine {
                 }
 
                 let payload = try JSONDecoder().decode(UsagePayload.self, from: data)
-                return usageSnapshotBuckets(from: payload)
+                return (nonEmpty(payload.planType).map(formatPlan), usageSnapshotBuckets(from: payload))
             } catch let error as UsageFetchError {
                 lastError = error
                 if let code = error.statusCode, usageShouldRetry(statusCode: code), attempt + 1 < usageRetryAttempts {

@@ -482,10 +482,10 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             await refreshModelProxyRoutingState()
             await refreshModelProxyRuntimeModel()
 
-            if let storage = detectedStorage {
-                loadUsageHistoryIfNeeded(storage: storage)
+            let canPersistUsageHistory = detectedStorage.map { loadUsageHistoryIfNeeded(storage: $0) } ?? false
+            if canPersistUsageHistory {
+                persistUsageSnapshotsIfNeeded()
             }
-            persistUsageSnapshotsIfNeeded()
             aggregateUsage = makeAggregateUsageSummary(from: profiles)
             updateSmartSwitchRecommendation()
             await evaluateUsageAlerts(trigger: trigger)
@@ -732,6 +732,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
         do {
             try await self.service.deleteProfile(id: id)
+            removeStoredProfileIDs([id])
             showBanner(title: "Profile deleted", body: "\(profile.primaryText) was removed from saved profiles.", tone: .success)
             await refresh(trigger: .mutation)
             return true
@@ -756,6 +757,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             for (id, _) in targets {
                 try await service.deleteProfile(id: id)
             }
+            removeStoredProfileIDs(Set(targets.map(\.0)))
             let descriptor = targets.count == 1 ? targets[0].1 : "\(targets.count) profiles"
             showBanner(title: "Profiles deleted", body: "Removed \(descriptor) from saved profiles.", tone: .success)
             await refresh(trigger: .mutation)
@@ -1227,15 +1229,26 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     }
 
     private func normalizeStoredOrdering() {
-        let availableIDs = Set(savedProfiles.compactMap(\.id))
-        orderedProfileIDs = orderedProfileIDs.filter { availableIDs.contains($0) }
-        favorites = favorites.filter { availableIDs.contains($0) }
+        orderedProfileIDs = deduplicatedIDs(orderedProfileIDs)
+        favorites = deduplicatedIDs(favorites)
 
         for id in savedProfiles.compactMap(\.id) where !orderedProfileIDs.contains(id) {
             orderedProfileIDs.append(id)
         }
 
         persistOrdering()
+    }
+
+    private func removeStoredProfileIDs(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        favorites.removeAll { ids.contains($0) }
+        orderedProfileIDs.removeAll { ids.contains($0) }
+        persistOrdering()
+    }
+
+    private func deduplicatedIDs(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        return ids.filter { seen.insert($0).inserted }
     }
 
     private func loadNotificationInbox() {
@@ -1366,6 +1379,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func flushPersistenceToDisk() {
         ensurePersistenceURLs()
+        guard hasLoadedUsageHistory else { return }
         persistUsageSnapshotsIfNeeded()
     }
 
@@ -1455,36 +1469,42 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
     }
 
-    private func loadUsageHistoryIfNeeded(storage: StorageResolution) {
-        guard !hasLoadedUsageHistory else { return }
+    @discardableResult
+    private func loadUsageHistoryIfNeeded(storage: StorageResolution) -> Bool {
+        guard !hasLoadedUsageHistory else { return true }
 
         let historyURL = storage.url.appendingPathComponent("profiles-bar-usage-history.json")
         let legacyHistoryURL = storage.url.appendingPathComponent("profiles/usage-history.json")
         usageHistoryURL = historyURL
-        defer { hasLoadedUsageHistory = true }
 
         if fileManager.fileExists(atPath: historyURL.path),
            let data = try? Data(contentsOf: historyURL),
            let store = decodeUsageHistoryStore(from: data) {
             usageHistoryByProfileID = store.entries
-            return
+            hasLoadedUsageHistory = true
+            return true
         }
 
-        if fileManager.fileExists(atPath: legacyHistoryURL.path),
+        if !fileManager.fileExists(atPath: historyURL.path),
+           fileManager.fileExists(atPath: legacyHistoryURL.path),
            let data = try? Data(contentsOf: legacyHistoryURL),
            let store = decodeUsageHistoryStore(from: data) {
             usageHistoryByProfileID = store.entries
+            hasLoadedUsageHistory = true
             writeUsageHistory()
-            return
+            return true
         }
 
-        guard fileManager.fileExists(atPath: historyURL.path),
-              let data = try? Data(contentsOf: historyURL),
-              let store = decodeUsageHistoryStore(from: data) else {
-            usageHistoryByProfileID = [:]
-            return
+        guard !fileManager.fileExists(atPath: historyURL.path),
+              !fileManager.fileExists(atPath: legacyHistoryURL.path) else {
+            return false
         }
-        usageHistoryByProfileID = store.entries
+
+        hasLoadedUsageHistory = true
+        if usageHistoryByProfileID.isEmpty {
+            usageHistoryByProfileID = [:]
+        }
+        return true
     }
 
     private func decodeUsageHistoryStore(from data: Data) -> ProfileUsageHistoryStore? {
@@ -1526,6 +1546,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func persistUsageSnapshotsIfNeeded() {
         ensurePersistenceURLs()
+        guard hasLoadedUsageHistory else { return }
         guard usageHistoryURL != nil || detectedStorage != nil else { return }
         if usageHistoryURL == nil, let detectedStorage {
             usageHistoryURL = detectedStorage.url.appendingPathComponent("profiles-bar-usage-history.json")
