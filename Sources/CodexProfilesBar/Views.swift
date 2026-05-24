@@ -43,6 +43,11 @@ struct MenuBarRootView: View {
     @State private var modelProxyEndpointSaveTask: Task<Void, Never>?
     @State private var modelContextWindowText = ""
     @State private var modelTokenLimitPercentText = ""
+    @State private var sessionThreadSourceID: String?
+    @State private var sessionThreadSearchText = ""
+    @State private var sessionThreadProviderFilter = "all"
+    @State private var sessionThreadProjectFilter = "all"
+    @State private var sessionThreadTargetProvider = "openai"
     private let scrollTopAnchorID = "profiles-scroll-top"
 
     private var palette: PanelPalette {
@@ -208,6 +213,10 @@ struct MenuBarRootView: View {
             ensureValidSelection()
             requestTopScroll()
             loadModelProxySettingsDraft()
+            Task {
+                await model.refreshSessionThreads()
+                loadSessionThreadCopyDraft()
+            }
         }
         .onDisappear {
             removeLocalKeyMonitor()
@@ -227,9 +236,25 @@ struct MenuBarRootView: View {
                 loadModelProxySettingsDraft()
             }
         }
+        .onChange(of: model.sessionThreads) { _, _ in
+            loadSessionThreadCopyDraft()
+        }
+        .onChange(of: sessionThreadSearchText) { _, _ in
+            loadSessionThreadCopyDraft()
+        }
+        .onChange(of: sessionThreadProviderFilter) { _, _ in
+            loadSessionThreadCopyDraft()
+        }
+        .onChange(of: sessionThreadProjectFilter) { _, _ in
+            loadSessionThreadCopyDraft()
+        }
         .onChange(of: selectedMainTab) { _, nextTab in
             if nextTab == .proxy {
                 loadModelProxySettingsDraft()
+                Task {
+                    await model.refreshSessionThreads()
+                    loadSessionThreadCopyDraft()
+                }
             } else {
                 modelProxyEndpointSaveTask?.cancel()
                 modelProxyEndpointSaveTask = nil
@@ -463,7 +488,7 @@ struct MenuBarRootView: View {
             } else {
                 HStack(spacing: 10) {
                     ProxyStatusBadge(state: model.modelProxyState)
-                    Text(model.modelProxyState.isCodexConfigured ? "Codex is routed through the local provider." : "Codex is not using the local provider.")
+                    Text(model.modelProxyState.isCodexConfigured ? model.modelProxyState.routingMode.statusDescription : model.modelProxyState.routingMode.inactiveDescription)
                         .font(.system(.caption, design: .rounded))
                         .foregroundStyle(palette.secondaryText)
                     Spacer(minLength: 0)
@@ -769,6 +794,59 @@ struct MenuBarRootView: View {
         } else {
             modelTokenLimitPercentText = ""
         }
+    }
+
+    private func loadSessionThreadCopyDraft() {
+        if let sessionThreadSourceID,
+           filteredSessionThreads.contains(where: { $0.id == sessionThreadSourceID }) {
+            return
+        }
+
+        sessionThreadSourceID = filteredSessionThreads.first?.id
+        if let source = filteredSessionThreads.first {
+            sessionThreadTargetProvider = source.provider == "openai" ? "codex-profiles-bar" : "openai"
+        }
+    }
+
+    private var filteredSessionThreads: [SessionThreadSummary] {
+        let query = sessionThreadSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return model.sessionThreads.filter { thread in
+            let matchesProvider = sessionThreadProviderFilter == "all" || thread.provider == sessionThreadProviderFilter
+            let matchesProject = sessionThreadProjectFilter == "all" || thread.project == sessionThreadProjectFilter
+            guard matchesProvider && matchesProject else { return false }
+            guard !query.isEmpty else { return true }
+
+            return thread.title.lowercased().contains(query)
+                || thread.provider.lowercased().contains(query)
+                || thread.project.lowercased().contains(query)
+                || thread.projectPath.lowercased().contains(query)
+                || thread.id.lowercased().contains(query)
+                || thread.relativePath.lowercased().contains(query)
+        }
+    }
+
+    private var sessionThreadProviderFilters: [String] {
+        var providers = ["all"]
+        for provider in model.sessionThreads.map(\.provider) where !providers.contains(provider) {
+            providers.append(provider)
+        }
+        return providers
+    }
+
+    private var sessionThreadProjectFilters: [String] {
+        var projects = ["all"]
+        for project in model.sessionThreads.map(\.project) where !projects.contains(project) {
+            projects.append(project)
+        }
+        return projects
+    }
+
+    private var sessionThreadProviderSuggestions: [String] {
+        var providers = ["openai", "codex-profiles-bar"]
+        for provider in model.sessionThreads.map(\.provider) where !providers.contains(provider) && provider != "unknown" {
+            providers.append(provider)
+        }
+        return Array(providers.prefix(6))
     }
 
     private func scheduleModelProxyEndpointSave() {
@@ -1461,7 +1539,7 @@ struct MenuBarRootView: View {
                         Text("Codex reopen required")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("The provider routing changed. Reopen Codex once so new chats bind to the current proxy state.")
+                        Text("The proxy routing changed. Reopen Codex once so new chats bind to the current proxy state.")
                             .font(.system(.caption, design: .rounded))
                             .foregroundStyle(palette.secondaryText)
 
@@ -1492,6 +1570,134 @@ struct MenuBarRootView: View {
                                     .stroke(palette.cardStroke, lineWidth: 1)
                             )
                     )
+                }
+
+                proxySettingsSection(
+                    title: "Routing mode",
+                    systemImage: "point.3.connected.trianglepath.dotted",
+                    description: "Choose how Codex should point at the local proxy."
+                ) {
+                    Picker(
+                        "Routing mode",
+                        selection: Binding(
+                            get: { model.modelProxyState.routingMode },
+                            set: { mode in
+                                Task { await model.setModelProxyRoutingMode(mode) }
+                            }
+                        )
+                    ) {
+                        ForEach(ModelProxyRoutingMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                proxySettingsSection(
+                    title: "Session thread copy",
+                    systemImage: "doc.on.doc",
+                    description: "Duplicate a saved Codex thread under another model provider."
+                ) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if model.isLoadingSessionThreads {
+                            ProgressView("Loading threads…")
+                                .controlSize(.small)
+                        } else if model.sessionThreads.isEmpty {
+                            Text("No local Codex session threads were found.")
+                                .font(.system(.caption, design: .rounded))
+                                .foregroundStyle(palette.secondaryText)
+                        } else {
+                            VStack(alignment: .leading, spacing: 8) {
+                                proxyField(title: "Search source", placeholder: "Title, project, provider, ID, path", text: $sessionThreadSearchText)
+
+                                HStack(alignment: .bottom, spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        Text("Provider")
+                                            .font(.system(.caption2, design: .rounded, weight: .bold))
+                                            .foregroundStyle(palette.secondaryText)
+                                        Picker(
+                                            "Provider",
+                                            selection: $sessionThreadProviderFilter
+                                        ) {
+                                            ForEach(sessionThreadProviderFilters, id: \.self) { provider in
+                                                Text(provider == "all" ? "All" : provider).tag(provider)
+                                            }
+                                        }
+                                        .pickerStyle(.menu)
+                                        .labelsHidden()
+                                        .frame(width: 150)
+                                    }
+
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        Text("Project")
+                                            .font(.system(.caption2, design: .rounded, weight: .bold))
+                                            .foregroundStyle(palette.secondaryText)
+                                        Picker(
+                                            "Project",
+                                            selection: $sessionThreadProjectFilter
+                                        ) {
+                                            ForEach(sessionThreadProjectFilters, id: \.self) { project in
+                                                Text(project == "all" ? "All" : project).tag(project)
+                                            }
+                                        }
+                                        .pickerStyle(.menu)
+                                        .labelsHidden()
+                                        .frame(width: 180)
+                                    }
+                                }
+                            }
+
+                            Picker(
+                                "Source thread",
+                                selection: Binding(
+                                    get: { sessionThreadSourceID ?? filteredSessionThreads.first?.id ?? "" },
+                                    set: { sessionThreadSourceID = $0 }
+                                )
+                            ) {
+                                ForEach(filteredSessionThreads) { thread in
+                                    Text("\(thread.title) • \(thread.project) • \(thread.provider)").tag(thread.id)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .disabled(filteredSessionThreads.isEmpty)
+
+                            if filteredSessionThreads.isEmpty {
+                                Text("No source threads match the current search.")
+                                    .font(.system(.caption, design: .rounded))
+                                    .foregroundStyle(palette.secondaryText)
+                            }
+
+                            HStack(alignment: .bottom, spacing: 10) {
+                                proxyField(title: "Destination provider", placeholder: "openai", text: $sessionThreadTargetProvider)
+
+                                Button {
+                                    Task {
+                                        _ = await model.copySessionThread(id: sessionThreadSourceID, to: sessionThreadTargetProvider)
+                                        loadSessionThreadCopyDraft()
+                                    }
+                                } label: {
+                                    if model.isCopyingSessionThread {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else {
+                                        Label("Copy", systemImage: "doc.on.doc")
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(model.isCopyingSessionThread || sessionThreadSourceID == nil || filteredSessionThreads.isEmpty)
+                            }
+
+                            HStack(spacing: 6) {
+                                ForEach(sessionThreadProviderSuggestions, id: \.self) { provider in
+                                    Button(provider) {
+                                        sessionThreadTargetProvider = provider
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                }
+                            }
+                        }
+                    }
                 }
 
                 proxySettingsSection(
@@ -3414,6 +3620,8 @@ struct SettingsView: View {
     @AppStorage(Preferences.groupingKey) private var grouping = ProfileGrouping.none.rawValue
     @AppStorage(Preferences.notificationsEnabledKey) private var notificationsEnabled = true
     @AppStorage(Preferences.autoSwitchOnDepletionKey) private var autoSwitchOnDepletion = false
+    @AppStorage(Preferences.switchWhenCodexClosesKey) private var switchWhenCodexCloses = false
+    @AppStorage(Preferences.switchWhenCodexClosesProfileIDKey) private var switchWhenCodexClosesProfileID = ""
     @AppStorage(Preferences.usageWarningThresholdKey) private var usageWarningThreshold = 10
     @AppStorage(Preferences.accentRedKey) private var accentRed = 0.15
     @AppStorage(Preferences.accentGreenKey) private var accentGreen = 0.44
@@ -3728,6 +3936,38 @@ struct SettingsView: View {
                     }
                 }
                 .toggleStyle(.switch)
+
+                Toggle(isOn: $switchWhenCodexCloses) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Switch after Codex closes")
+                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+                        Text("Prepares the selected profile for the next Codex launch.")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                if switchWhenCodexCloses {
+                    HStack(alignment: .center, spacing: 14) {
+                        Text("Profile after close")
+                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+
+                        Picker("Profile after close", selection: $switchWhenCodexClosesProfileID) {
+                            Text("Best available").tag("")
+                            ForEach(model.savedProfiles, id: \.stableID) { profile in
+                                if let id = profile.id {
+                                    Text(profile.primaryText).tag(id)
+                                }
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .disabled(model.savedProfiles.isEmpty)
+                    }
+                }
             }
         }
     }

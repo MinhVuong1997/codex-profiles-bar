@@ -219,6 +219,60 @@ actor CodexProfilesNativeEngine {
         return try readTopLevelConfigValue(paths: paths, key: "model_provider")
     }
 
+    func currentOpenAIBaseURL() throws -> String? {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        return try readTopLevelConfigValue(paths: paths, key: "openai_base_url")
+    }
+
+    func fetchSessionThreads() throws -> [SessionThreadSummary] {
+        let paths = try resolvePaths()
+        return try sessionThreads(paths: paths)
+    }
+
+    func copySessionThread(id: String, to provider: String) throws -> SessionThreadCopyResult {
+        let paths = try resolvePaths()
+        let targetProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !targetProvider.isEmpty else {
+            throw CodexProfilesError.commandFailed("Choose a destination model provider.")
+        }
+
+        guard let source = try sessionThreads(paths: paths).first(where: { $0.id == id }) else {
+            throw CodexProfilesError.commandFailed("Session thread `\(id)` was not found.")
+        }
+
+        let sourceURL = paths.codex.appendingPathComponent(source.relativePath)
+        let contents = try String(contentsOf: sourceURL, encoding: .utf8)
+        var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard !lines.isEmpty,
+              var metadata = jsonObject(from: lines[0]),
+              var payload = metadata["payload"] as? [String: Any] else {
+            throw CodexProfilesError.commandFailed("Session thread metadata is not readable.")
+        }
+
+        let copiedID = UUID().uuidString.lowercased()
+        let copiedAt = iso8601String(Date())
+        let copiedTitle = source.title
+        metadata["timestamp"] = copiedAt
+        payload["id"] = copiedID
+        payload["timestamp"] = copiedAt
+        payload["model_provider"] = targetProvider
+        metadata["payload"] = payload
+        lines[0] = try compactJSONString(metadata)
+
+        let destination = sessionFileURL(paths: paths, id: copiedID, date: Date())
+        try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try writeAtomicPrivate(data: Data(lines.joined(separator: "\n").utf8), to: destination)
+        try appendSessionIndexEntry(paths: paths, id: copiedID, title: copiedTitle, updatedAt: copiedAt)
+
+        return SessionThreadCopyResult(
+            id: copiedID,
+            title: copiedTitle,
+            provider: targetProvider,
+            relativePath: destination.path.replacingOccurrences(of: paths.codex.path + "/", with: "")
+        )
+    }
+
     func currentModelProviderBaseURL(key: String) throws -> String? {
         let paths = try resolvePaths()
         try ensurePaths(paths)
@@ -237,6 +291,18 @@ actor CodexProfilesNativeEngine {
         try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
     }
 
+    func setOpenAIBaseURL(_ value: String?) throws {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+        let contents = (try? String(contentsOf: paths.config, encoding: .utf8)) ?? ""
+        let updated = replaceRemoveOrAppendConfigLine(
+            contents: contents,
+            key: "openai_base_url",
+            line: value.map { "openai_base_url = \"\($0)\"" }
+        )
+        try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
+    }
+
     func upsertModelProxyProviderConfig(key: String, name: String, baseURL: String) throws {
         let paths = try resolvePaths()
         try ensurePaths(paths)
@@ -249,6 +315,7 @@ actor CodexProfilesNativeEngine {
                 "base_url = \"\(baseURL)\"",
                 "wire_api = \"responses\"",
                 "requires_openai_auth = false",
+                "supports_websockets = false",
             ]
         )
         try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
@@ -581,6 +648,8 @@ private extension CodexProfilesNativeEngine {
         let profilesIndex: URL
         let profilesLock: URL
         let config: URL
+        let sessions: URL
+        let sessionIndex: URL
     }
 
     struct NativeSnapshot {
@@ -877,7 +946,9 @@ private extension CodexProfilesNativeEngine {
             profiles: profiles,
             profilesIndex: profiles.appendingPathComponent("profiles.json"),
             profilesLock: profiles.appendingPathComponent("profiles.lock"),
-            config: codex.appendingPathComponent("config.toml")
+            config: codex.appendingPathComponent("config.toml"),
+            sessions: codex.appendingPathComponent("sessions", isDirectory: true),
+            sessionIndex: codex.appendingPathComponent("session_index.jsonl")
         )
     }
 
@@ -902,6 +973,139 @@ private extension CodexProfilesNativeEngine {
         }
         fileManager.createFile(atPath: url.path, contents: Data())
         try setPOSIXPermissions(path: url.path, mode: 0o600)
+    }
+
+    func sessionThreads(paths: NativePaths) throws -> [SessionThreadSummary] {
+        let index = readSessionIndex(paths: paths)
+        var threads = [String: SessionThreadSummary]()
+
+        for root in [paths.sessions] where fileManager.fileExists(atPath: root.path) {
+            guard let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for case let fileURL as URL in enumerator where fileURL.pathExtension == "jsonl" {
+                guard let firstLine = try firstLine(at: fileURL),
+                      let metadata = jsonObject(from: firstLine),
+                      metadata["type"] as? String == "session_meta",
+                      let payload = metadata["payload"] as? [String: Any],
+                      let id = payload["id"] as? String else {
+                    continue
+                }
+
+                let indexed = index[id]
+                let provider = (payload["model_provider"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let projectPath = (payload["cwd"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let projectName = projectName(for: projectPath)
+                let indexedTitle = indexed?.threadName.trimmingCharacters(in: .whitespacesAndNewlines)
+                let title = indexedTitle?.isEmpty == false ? indexedTitle! : id
+                let indexedUpdatedAt = indexed?.updatedAt.trimmingCharacters(in: .whitespacesAndNewlines)
+                let updatedAt = indexedUpdatedAt?.isEmpty == false ? indexedUpdatedAt! : (payload["timestamp"] as? String) ?? ""
+                let relativePath = fileURL.path.replacingOccurrences(of: paths.codex.path + "/", with: "")
+                threads[id] = SessionThreadSummary(
+                    id: id,
+                    title: title,
+                    provider: provider?.isEmpty == false ? provider! : "unknown",
+                    project: projectName,
+                    projectPath: projectPath,
+                    updatedAt: updatedAt,
+                    relativePath: relativePath
+                )
+            }
+        }
+
+        return Array(threads.values)
+            .sorted { lhs, rhs in
+                if lhs.updatedAt == rhs.updatedAt {
+                    return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+                }
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            .prefix(120)
+            .map { $0 }
+    }
+
+    func readSessionIndex(paths: NativePaths) -> [String: (threadName: String, updatedAt: String)] {
+        guard let contents = try? String(contentsOf: paths.sessionIndex, encoding: .utf8) else {
+            return [:]
+        }
+
+        var index = [String: (threadName: String, updatedAt: String)]()
+        for line in contents.split(whereSeparator: \.isNewline) {
+            guard let object = jsonObject(from: String(line)),
+                  let id = object["id"] as? String else {
+                continue
+            }
+            index[id] = (
+                threadName: object["thread_name"] as? String ?? "",
+                updatedAt: object["updated_at"] as? String ?? ""
+            )
+        }
+        return index
+    }
+
+    func appendSessionIndexEntry(paths: NativePaths, id: String, title: String, updatedAt: String) throws {
+        let entry = try compactJSONString([
+            "id": id,
+            "thread_name": title,
+            "updated_at": updatedAt,
+        ])
+        let existing = (try? String(contentsOf: paths.sessionIndex, encoding: .utf8)) ?? ""
+        let separator = existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n"
+        let updated = existing + separator + entry + "\n"
+        try writeAtomicPrivate(data: Data(updated.utf8), to: paths.sessionIndex)
+    }
+
+    func sessionFileURL(paths: NativePaths, id: String, date: Date) -> URL {
+        let calendar = Calendar.current
+        let year = String(format: "%04d", calendar.component(.year, from: date))
+        let month = String(format: "%02d", calendar.component(.month, from: date))
+        let day = String(format: "%02d", calendar.component(.day, from: date))
+        let filenameFormatter = DateFormatter()
+        filenameFormatter.locale = Locale(identifier: "en_US_POSIX")
+        filenameFormatter.dateFormat = "yyyy-MM-dd'T'HH-mm-ss"
+        let name = "rollout-\(filenameFormatter.string(from: date))-\(id).jsonl"
+        return paths.sessions
+            .appendingPathComponent(year, isDirectory: true)
+            .appendingPathComponent(month, isDirectory: true)
+            .appendingPathComponent(day, isDirectory: true)
+            .appendingPathComponent(name)
+    }
+
+    func firstLine(at url: URL) throws -> String? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: 64 * 1024) ?? Data()
+        guard let text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)
+    }
+
+    func jsonObject(from line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object
+    }
+
+    func compactJSONString(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw CodexProfilesError.commandFailed("Could not encode session metadata.")
+        }
+        return text
+    }
+
+    func iso8601String(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     func isDirectory(_ url: URL) -> Bool {
@@ -952,6 +1156,69 @@ private extension CodexProfilesNativeEngine {
                 index: index
             )
         }
+    }
+
+    private func projectName(for path: String) -> String {
+        guard !path.isEmpty else {
+            return "Chats"
+        }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        if isSystemTemporaryPath(url.path) || isCodexDocumentsChatPath(url.path) {
+            return "Chats"
+        }
+        let name = url.lastPathComponent
+        return name.isEmpty ? path : name
+    }
+
+    private func isSystemTemporaryPath(_ path: String) -> Bool {
+        let standardizedPath = NSString(string: path).standardizingPath
+        let temporaryPath = NSString(string: NSTemporaryDirectory()).standardizingPath
+        let temporaryRoots = [
+            temporaryPath,
+            "/tmp",
+            "/private/tmp",
+            "/var/tmp",
+            "/private/var/tmp",
+            "/var/folders",
+            "/private/var/folders",
+        ]
+
+        if temporaryRoots.contains(where: { isPath(standardizedPath, inside: $0) }) {
+            return true
+        }
+
+        return standardizedPath
+            .split(separator: "/")
+            .contains { component in
+                component == "TemporaryItems" || component == "Temporary Items"
+            }
+    }
+
+    private func isPath(_ path: String, inside root: String) -> Bool {
+        path == root || path.hasPrefix(root + "/")
+    }
+
+    private func isCodexDocumentsChatPath(_ path: String) -> Bool {
+        let standardizedPath = NSString(string: path).standardizingPath
+        let root = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents", isDirectory: true)
+            .appendingPathComponent("Codex", isDirectory: true)
+            .standardizedFileURL
+            .path
+        guard isPath(standardizedPath, inside: root) else {
+            return false
+        }
+
+        let relativePath = String(standardizedPath.dropFirst(root.count))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let dateFolder = relativePath.split(separator: "/").first else {
+            return false
+        }
+        return isDateFolderName(String(dateFolder))
+    }
+
+    private func isDateFolderName(_ name: String) -> Bool {
+        name.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
     }
 
     func loadStore(paths: NativePaths) throws -> NativeStore {

@@ -50,12 +50,28 @@ actor CodexProfilesService {
         try await engine.currentModelProviderKey()
     }
 
+    func currentOpenAIBaseURL() async throws -> String? {
+        try await engine.currentOpenAIBaseURL()
+    }
+
+    func fetchSessionThreads() async throws -> [SessionThreadSummary] {
+        try await engine.fetchSessionThreads()
+    }
+
+    func copySessionThread(id: String, to provider: String) async throws -> SessionThreadCopyResult {
+        try await engine.copySessionThread(id: id, to: provider)
+    }
+
     func currentModelProviderBaseURL(key: String) async throws -> String? {
         try await engine.currentModelProviderBaseURL(key: key)
     }
 
     func setCurrentModelProviderKey(_ value: String?) async throws {
         try await engine.setCurrentModelProviderKey(value)
+    }
+
+    func setOpenAIBaseURL(_ value: String?) async throws {
+        try await engine.setOpenAIBaseURL(value)
     }
 
     func upsertModelProxyProviderConfig(key: String, name: String, baseURL: String) async throws {

@@ -221,6 +221,16 @@ private extension CodexModelProxyServer {
                 return
             }
 
+            if isResponsesWebSocketUpgradeTarget(request) {
+                try sendResponse(
+                    statusCode: 426,
+                    headers: [("Content-Length", "0")] + corsHeaders(),
+                    body: Data(),
+                    to: socket
+                )
+                return
+            }
+
             guard let upstreamURL = upstreamURL(for: request.target, baseURL: upstreamBaseURL) else {
                 try sendJSON(statusCode: 400, object: ["error": "Invalid request target."], to: socket)
                 return
@@ -568,6 +578,19 @@ private extension CodexModelProxyServer {
             || path.hasPrefix("/v1/responses/")
             || path == "/backend-api/codex/responses"
             || path.hasPrefix("/backend-api/codex/responses/")
+    }
+
+    static func isResponsesWebSocketUpgradeTarget(_ request: ProxyRequest) -> Bool {
+        guard request.method.caseInsensitiveCompare("GET") == .orderedSame,
+              isResponsesTarget(request.target),
+              headerValue("Upgrade", in: request.headers)?.caseInsensitiveCompare("websocket") == .orderedSame,
+              let connection = headerValue("Connection", in: request.headers)?.lowercased() else {
+            return false
+        }
+
+        return connection
+            .split(separator: ",")
+            .contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "upgrade" }
     }
 
     static func normalizeResponsesEventStream(_ text: String, requestBody: Data) -> String {
