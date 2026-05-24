@@ -282,6 +282,10 @@ extension ProfileStatus {
     }
 
     var usageDisplayPercent: Int? {
+        primaryUsageBucket?.displayRemainingPercent
+    }
+
+    var usageLimitPercent: Int? {
         primaryUsageBucket?.effectiveRemainingPercent
     }
 
@@ -300,7 +304,7 @@ extension ProfileStatus {
     }
 
     func isLowUsage(threshold: Int) -> Bool {
-        guard let percent = usageDisplayPercent else { return false }
+        guard let percent = usageLimitPercent else { return false }
         return percent <= threshold
     }
 
@@ -313,6 +317,14 @@ extension ProfileStatus {
 }
 
 extension UsageBucket {
+    var displayRemainingPercent: Int? {
+        let windows = [fiveHour, weekly].compactMap { $0 }
+        guard let window = windows.min(by: { $0.resetAt < $1.resetAt }) else {
+            return nil
+        }
+        return window.leftPercent
+    }
+
     var effectiveRemainingPercent: Int? {
         let remainingPercents = [fiveHour?.leftPercent, weekly?.leftPercent].compactMap { $0 }
         return remainingPercents.min()

@@ -79,6 +79,12 @@ private extension CodexModelProxyServer {
     static let headerLimit = 64 * 1024
     static let bodyLimit = 100 * 1024 * 1024
     static let delimiter = Data([13, 10, 13, 10])
+    static let compactRequestSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 300
+        configuration.timeoutIntervalForResource = 600
+        return URLSession(configuration: configuration)
+    }()
 
     static func makeLoopbackSocket(port: Int) throws -> Int32 {
         guard (1...65_535).contains(port) else {
@@ -221,13 +227,24 @@ private extension CodexModelProxyServer {
                 return
             }
 
+            if isResponsesWebSocketUpgradeTarget(request) {
+                try sendResponse(
+                    statusCode: 426,
+                    headers: [("Content-Length", "0")] + corsHeaders(),
+                    body: Data(),
+                    to: socket
+                )
+                return
+            }
+
             guard let upstreamURL = upstreamURL(for: request.target, baseURL: upstreamBaseURL) else {
                 try sendJSON(statusCode: 400, object: ["error": "Invalid request target."], to: socket)
                 return
             }
 
             let credential = try await credentialProvider()
-            let (data, response) = try await URLSession.shared.data(for: upstreamRequest(
+            let session = upstreamSession(for: request)
+            let (data, response) = try await session.data(for: upstreamRequest(
                 from: request,
                 upstreamURL: upstreamURL,
                 credential: credential
@@ -568,6 +585,31 @@ private extension CodexModelProxyServer {
             || path.hasPrefix("/v1/responses/")
             || path == "/backend-api/codex/responses"
             || path.hasPrefix("/backend-api/codex/responses/")
+    }
+
+    static func isResponsesCompactTarget(_ target: String) -> Bool {
+        guard let path = requestComponents(for: target)?.path else {
+            return false
+        }
+        return path == "/v1/responses/compact"
+            || path == "/backend-api/codex/responses/compact"
+    }
+
+    static func upstreamSession(for request: ProxyRequest) -> URLSession {
+        isResponsesCompactTarget(request.target) ? compactRequestSession : .shared
+    }
+
+    static func isResponsesWebSocketUpgradeTarget(_ request: ProxyRequest) -> Bool {
+        guard request.method.caseInsensitiveCompare("GET") == .orderedSame,
+              isResponsesTarget(request.target),
+              headerValue("Upgrade", in: request.headers)?.caseInsensitiveCompare("websocket") == .orderedSame,
+              let connection = headerValue("Connection", in: request.headers)?.lowercased() else {
+            return false
+        }
+
+        return connection
+            .split(separator: ",")
+            .contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "upgrade" }
     }
 
     static func normalizeResponsesEventStream(_ text: String, requestBody: Data) -> String {

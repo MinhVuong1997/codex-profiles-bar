@@ -46,6 +46,10 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     @Published private(set) var activeImportPreview: PendingImportPreview?
     @Published private(set) var modelProxyState = ModelProxyState.disabled
     @Published private(set) var modelProxyRuntimeModel = ModelProxyRuntimeModel(name: "gpt-5.5", contextWindow: nil, autoCompactTokenLimit: nil)
+    @Published private(set) var sessionThreads: [SessionThreadSummary] = []
+    @Published private(set) var isLoadingSessionThreads = false
+    @Published private(set) var isCopyingSessionThread = false
+    @Published private(set) var lastSessionThreadCopy: SessionThreadCopyResult?
     @Published var banner: BannerMessage?
 
     private let service = CodexProfilesService.shared
@@ -76,6 +80,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private var usageHistoryURL: URL?
     private var hasLoadedUsageHistory = false
     private var isPerformingAutomaticSwitch = false
+    private var isSwitchingAfterCodexClose = false
     private var presentedUpdateVersion: String?
     override init() {
         let storedAutoRefresh = UserDefaults.standard.object(forKey: Preferences.autoRefreshKey) as? Bool
@@ -91,6 +96,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         Task {
             await refreshModelProxyRoutingState()
             await refreshModelProxyRuntimeModel()
+            await refreshSessionThreads()
             if modelProxyState.isEnabled {
                 try? await syncCodexRoutingToProxyEnabledState(true)
                 await startModelProxy(shouldShowBanner: false)
@@ -103,6 +109,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             await refresh(trigger: .manual)
         }
         installNotificationActionObserver()
+        installCodexTerminationObserver()
     }
 
     deinit {
@@ -113,6 +120,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         bannerDismissTask?.cancel()
         codexLoginProcess?.terminate()
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     var menuBarSymbolName: String {
@@ -202,6 +210,70 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         configureAllProfilesAutoRefreshLoop()
     }
 
+    func refreshSessionThreads() async {
+        isLoadingSessionThreads = true
+        defer { isLoadingSessionThreads = false }
+
+        do {
+            sessionThreads = try await service.fetchSessionThreads()
+        } catch {
+            showBanner(title: "Could not load session threads", body: error.localizedDescription, tone: .error)
+        }
+    }
+
+    func copySessionThread(id: String?, to provider: String) async -> Bool {
+        guard let id, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            showBanner(title: "Choose a thread", body: "Select a source session thread to copy.", tone: .error)
+            return false
+        }
+
+        let targetProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !targetProvider.isEmpty else {
+            showBanner(title: "Choose a provider", body: "Enter the destination model provider.", tone: .error)
+            return false
+        }
+
+        isCopyingSessionThread = true
+        defer { isCopyingSessionThread = false }
+
+        do {
+            let result = try await service.copySessionThread(id: id, to: targetProvider)
+            lastSessionThreadCopy = result
+            await refreshSessionThreads()
+            showBanner(
+                title: "Session thread copied",
+                body: "Created \(result.title) for \(result.provider).",
+                tone: .success
+            )
+            return true
+        } catch {
+            showBanner(title: "Could not copy thread", body: error.localizedDescription, tone: .error)
+            return false
+        }
+    }
+
+    func setModelProxyRoutingMode(_ mode: ModelProxyRoutingMode) async {
+        UserDefaults.standard.set(mode.rawValue, forKey: Preferences.modelProxyRoutingModeKey)
+        modelProxyState.routingMode = mode
+
+        do {
+            if modelProxyState.isEnabled {
+                try await syncCodexRoutingToProxyEnabledState(true)
+                showBanner(
+                    title: "Proxy routing saved",
+                    body: "Reopen Codex so new chats use \(mode.title).",
+                    tone: .success
+                )
+            } else {
+                await refreshModelProxyRoutingState()
+                showBanner(title: "Proxy routing saved", body: "Enable the model proxy when you are ready to use it.", tone: .success)
+            }
+        } catch {
+            modelProxyState.lastError = error.localizedDescription
+            showBanner(title: "Proxy failed", body: error.localizedDescription, tone: .error)
+        }
+    }
+
     func refreshModelProxyRuntimeModel() async {
         do {
             modelProxyRuntimeModel = try await service.currentModelProxyRuntimeModel()
@@ -226,7 +298,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
                 showBanner(
                     title: "Model proxy running",
-                    body: "Codex now points to the local provider proxy.",
+                    body: "Codex now points to \(modelProxyState.routingMode.title).",
                     tone: .success
                 )
             } else {
@@ -283,7 +355,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 }
                 showBanner(
                     title: "Proxy settings saved",
-                    body: "Codex was repointed to the new local provider URL.",
+                    body: "Codex was repointed using \(modelProxyState.routingMode.title).",
                     tone: .success
                 )
             } catch {
@@ -465,12 +537,12 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             switch scope {
             case .activeProfile:
                 let (activeProfile, storage) = try await service.fetchActiveProfile()
-                mergeActiveProfile(activeProfile)
+                mergeActiveProfile(profilePreservingTransientUsage(activeProfile))
                 detectedStorage = storage
                 lastRefresh = .now
             case .allProfiles:
                 let (response, storage) = try await service.fetchProfiles()
-                profiles = sortProfiles(response.profiles)
+                profiles = sortProfiles(profilesPreservingTransientUsage(response.profiles))
                 detectedStorage = storage
                 lastRefresh = .now
                 refreshLaunchAtLoginState()
@@ -939,6 +1011,38 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         updateSmartSwitchRecommendation()
     }
 
+    private func profilesPreservingTransientUsage(_ incomingProfiles: [ProfileStatus]) -> [ProfileStatus] {
+        incomingProfiles.map(profilePreservingTransientUsage)
+    }
+
+    private func profilePreservingTransientUsage(_ incomingProfile: ProfileStatus) -> ProfileStatus {
+        guard !incomingProfile.isApiKey,
+              incomingProfile.usage == nil,
+              let previousProfile = matchingExistingProfile(for: incomingProfile),
+              previousProfile.hasUsageData else {
+            return incomingProfile
+        }
+
+        return ProfileStatus(
+            id: incomingProfile.id,
+            label: incomingProfile.label,
+            email: incomingProfile.email,
+            plan: incomingProfile.plan ?? previousProfile.plan,
+            isCurrent: incomingProfile.isCurrent,
+            isSaved: incomingProfile.isSaved,
+            isApiKey: incomingProfile.isApiKey,
+            warnings: incomingProfile.warnings,
+            usage: previousProfile.usage,
+            error: incomingProfile.error
+        )
+    }
+
+    private func matchingExistingProfile(for incomingProfile: ProfileStatus) -> ProfileStatus? {
+        profiles.first { profile in
+            profile.stableID == incomingProfile.stableID || (profile.isCurrent && incomingProfile.isCurrent)
+        }
+    }
+
     private func applyOptimisticSwitch(to target: ProfileStatus) {
         guard !profiles.isEmpty else { return }
 
@@ -995,7 +1099,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             do {
                 let (response, storage) = try await service.fetchProfiles()
                 guard !Task.isCancelled else { return }
-                profiles = sortProfiles(response.profiles)
+                profiles = sortProfiles(profilesPreservingTransientUsage(response.profiles))
                 detectedStorage = storage
                 lastRefresh = .now
                 refreshLaunchAtLoginState()
@@ -1008,14 +1112,14 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         do {
             let (activeProfile, storage) = try await service.fetchActiveProfile()
             guard !Task.isCancelled else { return }
-            mergeActiveProfile(activeProfile)
+            mergeActiveProfile(profilePreservingTransientUsage(activeProfile))
             detectedStorage = storage
             lastRefresh = .now
         } catch {
             do {
                 let (response, storage) = try await service.fetchProfiles()
                 guard !Task.isCancelled else { return }
-                profiles = sortProfiles(response.profiles)
+                profiles = sortProfiles(profilesPreservingTransientUsage(response.profiles))
                 detectedStorage = storage
                 lastRefresh = .now
                 refreshLaunchAtLoginState()
@@ -1031,6 +1135,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
         guard let upstreamURL = Self.validModelProxyUpstreamURL(upstreamText) else {
             modelProxyState = ModelProxyState(
+                routingMode: Self.storedModelProxyRoutingMode(),
                 isEnabled: true,
                 isRunning: false,
                 endpoint: Self.modelProxyEndpointString(port: port),
@@ -1060,6 +1165,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             }
 
             modelProxyState = ModelProxyState(
+                routingMode: Self.storedModelProxyRoutingMode(),
                 isEnabled: true,
                 isRunning: true,
                 endpoint: endpoint.absoluteString,
@@ -1076,6 +1182,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             }
         } catch {
             modelProxyState = ModelProxyState(
+                routingMode: Self.storedModelProxyRoutingMode(),
                 isEnabled: true,
                 isRunning: false,
                 endpoint: Self.modelProxyEndpointString(port: port),
@@ -1099,14 +1206,24 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func refreshModelProxyRoutingState() async {
         let port = Self.storedModelProxyPort()
+        let routingMode = Self.storedModelProxyRoutingMode()
+        modelProxyState.routingMode = routingMode
         modelProxyState.endpoint = Self.modelProxyEndpointString(port: port)
         modelProxyState.codexBaseURL = Self.modelProxyCodexBaseURLString(port: port)
 
         do {
-            let providerKey = try await service.currentModelProviderKey()
-            let providerBaseURL = try await service.currentModelProviderBaseURL(key: Self.modelProxyProviderKey)
-            modelProxyState.isCodexConfigured = providerKey == Self.modelProxyProviderKey
-                && providerBaseURL == Self.modelProxyCodexBaseURLString(port: port)
+            switch routingMode {
+            case .customProvider:
+                let providerKey = try await service.currentModelProviderKey()
+                let providerBaseURL = try await service.currentModelProviderBaseURL(key: Self.modelProxyProviderKey)
+                modelProxyState.isCodexConfigured = providerKey == Self.modelProxyProviderKey
+                    && providerBaseURL == Self.modelProxyCodexBaseURLString(port: port)
+            case .overwriteOpenAI:
+                let providerKey = try await service.currentModelProviderKey()
+                let openAIBaseURL = try await service.currentOpenAIBaseURL()
+                modelProxyState.isCodexConfigured = Self.isOpenAIProviderKey(providerKey)
+                    && openAIBaseURL == Self.modelProxyCodexBaseURLString(port: port)
+            }
         } catch {
             modelProxyState.isCodexConfigured = false
         }
@@ -1114,38 +1231,97 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func syncCodexRoutingToProxyEnabledState(_ enabled: Bool) async throws {
         let desiredBaseURL = Self.modelProxyCodexBaseURLString(port: Self.storedModelProxyPort())
+        let routingMode = Self.storedModelProxyRoutingMode()
+        modelProxyState.routingMode = routingMode
+
         if enabled {
-            let currentProvider = try await service.currentModelProviderKey()
-            let currentBaseURL = try await service.currentModelProviderBaseURL(key: Self.modelProxyProviderKey)
-            if currentProvider != Self.modelProxyProviderKey {
-                UserDefaults.standard.set(currentProvider, forKey: Preferences.modelProxyPreviousModelProviderKey)
-            }
-            try await service.upsertModelProxyProviderConfig(
-                key: Self.modelProxyProviderKey,
-                name: "Codex Profiles Bar",
-                baseURL: desiredBaseURL
-            )
-            let didChangeProvider = currentProvider != Self.modelProxyProviderKey
-            let didChangeBaseURL = currentBaseURL != desiredBaseURL
-            if didChangeProvider {
+            switch routingMode {
+            case .customProvider:
+                let currentProvider = try await service.currentModelProviderKey()
+                let currentProviderBaseURL = try await service.currentModelProviderBaseURL(key: Self.modelProxyProviderKey)
+                let currentOpenAIBaseURL = try await service.currentOpenAIBaseURL()
+
+                captureCurrentModelProviderIfNeeded(currentProvider)
+                try await service.upsertModelProxyProviderConfig(
+                    key: Self.modelProxyProviderKey,
+                    name: "Codex Profiles Bar",
+                    baseURL: desiredBaseURL
+                )
                 try await service.setCurrentModelProviderKey(Self.modelProxyProviderKey)
+                try await restoreOpenAIBaseURLIfNeeded(currentOpenAIBaseURL: currentOpenAIBaseURL, desiredBaseURL: desiredBaseURL)
+
+                modelProxyState.requiresCodexRelaunch = currentProvider != Self.modelProxyProviderKey
+                    || currentProviderBaseURL != desiredBaseURL
+                    || currentOpenAIBaseURL == desiredBaseURL
+            case .overwriteOpenAI:
+                let currentProvider = try await service.currentModelProviderKey()
+                let currentOpenAIBaseURL = try await service.currentOpenAIBaseURL()
+
+                captureCurrentModelProviderIfNeeded(currentProvider)
+                captureCurrentOpenAIBaseURLIfNeeded(currentOpenAIBaseURL, desiredBaseURL: desiredBaseURL)
+                try await service.setCurrentModelProviderKey(nil)
+                try await service.setOpenAIBaseURL(desiredBaseURL)
+                try await service.removeModelProxyProviderConfig(key: Self.modelProxyProviderKey)
+
+                modelProxyState.requiresCodexRelaunch = !Self.isOpenAIProviderKey(currentProvider)
+                    || currentOpenAIBaseURL != desiredBaseURL
             }
-            modelProxyState.requiresCodexRelaunch = didChangeProvider || didChangeBaseURL
         } else {
             let previousProvider = UserDefaults.standard.string(forKey: Preferences.modelProxyPreviousModelProviderKey)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let currentProvider = try await service.currentModelProviderKey()
+            let currentOpenAIBaseURL = try await service.currentOpenAIBaseURL()
             if let previousProvider, !previousProvider.isEmpty {
                 try await service.setCurrentModelProviderKey(previousProvider)
             } else {
                 try await service.setCurrentModelProviderKey(nil)
             }
+            if UserDefaults.standard.object(forKey: Preferences.modelProxyPreviousOpenAIBaseURLKey) != nil {
+                let previousOpenAIBaseURL = UserDefaults.standard.string(forKey: Preferences.modelProxyPreviousOpenAIBaseURLKey)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try await service.setOpenAIBaseURL(previousOpenAIBaseURL?.isEmpty == false ? previousOpenAIBaseURL : nil)
+            } else if currentOpenAIBaseURL == desiredBaseURL {
+                try await service.setOpenAIBaseURL(nil)
+            }
             try await service.removeModelProxyProviderConfig(key: Self.modelProxyProviderKey)
             UserDefaults.standard.removeObject(forKey: Preferences.modelProxyPreviousModelProviderKey)
+            UserDefaults.standard.removeObject(forKey: Preferences.modelProxyPreviousOpenAIBaseURLKey)
             modelProxyState.requiresCodexRelaunch = currentProvider == Self.modelProxyProviderKey
+                || currentOpenAIBaseURL == desiredBaseURL
         }
 
         await refreshModelProxyRoutingState()
+    }
+
+    private func captureCurrentModelProviderIfNeeded(_ currentProvider: String?) {
+        guard UserDefaults.standard.object(forKey: Preferences.modelProxyPreviousModelProviderKey) == nil,
+              let currentProvider,
+              currentProvider != Self.modelProxyProviderKey,
+              !Self.isOpenAIProviderKey(currentProvider) else {
+            return
+        }
+
+        UserDefaults.standard.set(currentProvider, forKey: Preferences.modelProxyPreviousModelProviderKey)
+    }
+
+    private func captureCurrentOpenAIBaseURLIfNeeded(_ currentOpenAIBaseURL: String?, desiredBaseURL: String) {
+        guard UserDefaults.standard.object(forKey: Preferences.modelProxyPreviousOpenAIBaseURLKey) == nil,
+              currentOpenAIBaseURL != desiredBaseURL else {
+            return
+        }
+
+        UserDefaults.standard.set(currentOpenAIBaseURL ?? "", forKey: Preferences.modelProxyPreviousOpenAIBaseURLKey)
+    }
+
+    private func restoreOpenAIBaseURLIfNeeded(currentOpenAIBaseURL: String?, desiredBaseURL: String) async throws {
+        if UserDefaults.standard.object(forKey: Preferences.modelProxyPreviousOpenAIBaseURLKey) != nil {
+            let previousOpenAIBaseURL = UserDefaults.standard.string(forKey: Preferences.modelProxyPreviousOpenAIBaseURLKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            try await service.setOpenAIBaseURL(previousOpenAIBaseURL?.isEmpty == false ? previousOpenAIBaseURL : nil)
+            UserDefaults.standard.removeObject(forKey: Preferences.modelProxyPreviousOpenAIBaseURLKey)
+        } else if currentOpenAIBaseURL == desiredBaseURL {
+            try await service.setOpenAIBaseURL(nil)
+        }
     }
 
     private func updateProfileLocally(
@@ -1328,6 +1504,15 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         )
     }
 
+    private func installCodexTerminationObserver() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleWorkspaceApplicationTerminated(_:)),
+            name: NSWorkspace.didTerminateApplicationNotification,
+            object: nil
+        )
+    }
+
     @objc
     private func handleReopenCodexNotificationAction() {
         Task { @MainActor in
@@ -1350,6 +1535,72 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     @objc
     private func handleAppWillTerminateNotification() {
         flushPersistenceToDisk()
+    }
+
+    @objc
+    private func handleWorkspaceApplicationTerminated(_ notification: Notification) {
+        guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              isCodexDesktopApplication(application) else {
+            return
+        }
+
+        Task { @MainActor in
+            await switchProfileAfterCodexCloseIfNeeded()
+        }
+    }
+
+    private func isCodexDesktopApplication(_ application: NSRunningApplication) -> Bool {
+        guard application.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            return false
+        }
+
+        let currentBundleID = Bundle.main.bundleIdentifier?.lowercased()
+        let bundleID = application.bundleIdentifier?.lowercased()
+        let appName = application.localizedName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if let bundleID, bundleID == currentBundleID {
+            return false
+        }
+        if appName == "codex" {
+            return true
+        }
+        if let bundleID, bundleID == "com.openai.codex" || bundleID == "com.openai.codexdesktop" {
+            return true
+        }
+        return false
+    }
+
+    private func switchProfileAfterCodexCloseIfNeeded() async {
+        let enabled = UserDefaults.standard.object(forKey: Preferences.switchWhenCodexClosesKey) as? Bool ?? false
+        guard enabled, !isSwitchingAfterCodexClose else { return }
+        guard let target = codexCloseSwitchTargetProfile() else { return }
+
+        isSwitchingAfterCodexClose = true
+        defer { isSwitchingAfterCodexClose = false }
+
+        let mode: SwitchMode = hasUnsavedCurrentProfile ? .saveThenSwitch : .standard
+        _ = await switchToProfile(
+            target,
+            mode: mode,
+            shouldPromptReopen: false,
+            successTitle: "Switched after Codex closed",
+            successBody: "Prepared \(target.primaryText) for the next Codex launch."
+        )
+    }
+
+    private func codexCloseSwitchTargetProfile() -> ProfileStatus? {
+        let targetID = UserDefaults.standard
+            .string(forKey: Preferences.switchWhenCodexClosesProfileIDKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let targetID, !targetID.isEmpty {
+            guard let target = savedProfiles.first(where: { $0.id == targetID }) else {
+                return nil
+            }
+            return target.isCurrent ? nil : (target.canSwitch ? target : nil)
+        }
+
+        return bestAutoSwitchFallback() ?? savedProfiles.first(where: \.canSwitch)
     }
 
     private func scheduleProxyDrivenRefresh() {
@@ -1640,7 +1891,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         let candidates = savedProfiles
             .filter { !$0.isCurrent && $0.canSwitch && $0.hasRemainingUsage }
             .compactMap { profile -> (ProfileStatus, Int, Int)? in
-                guard let usagePercent = profile.usageDisplayPercent, usagePercent > 0 else { return nil }
+                guard let usagePercent = profile.usageLimitPercent, usagePercent > 0 else { return nil }
                 let resetAt = profile.primaryUsageBucket?.nearestResetAt ?? Int.max
                 return (profile, usagePercent, resetAt)
             }
@@ -1679,8 +1930,6 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         guard let currentProfile = profiles.first(where: \.isCurrent),
               let id = currentProfile.id,
               let bucket = currentProfile.primaryUsageBucket else {
-            lowUsageNotifications.removeAll()
-            resetSoonNotifications.removeAll()
             return
         }
 
@@ -1694,7 +1943,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             await scheduleNotification(
                 identifier: "low-usage-\(id)",
                 title: "Codex profile running low",
-                body: "\(currentProfile.primaryText) is at \(currentProfile.usageDisplayPercent ?? 0)% remaining.",
+                body: "\(currentProfile.primaryText) is at \(currentProfile.usageLimitPercent ?? 0)% remaining.",
                 inboxTone: .warning,
                 inboxActionKind: recommendation.map { _ in .switchToProfile },
                 inboxActionLabel: recommendation.map { "Switch to \($0.profileName)" },
@@ -1778,7 +2027,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private func bestAutoSwitchFallback() -> ProfileStatus? {
         savedProfiles
             .filter { !$0.isCurrent && $0.canSwitch && $0.hasRemainingUsage }
-            .max(by: { ($0.usageDisplayPercent ?? 0) < ($1.usageDisplayPercent ?? 0) })
+            .max(by: { ($0.usageLimitPercent ?? 0) < ($1.usageLimitPercent ?? 0) })
     }
 
     private func scheduleNotification(
@@ -2059,6 +2308,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         let port = storedModelProxyPort()
         let upstream = storedModelProxyUpstream()
         return ModelProxyState(
+            routingMode: storedModelProxyRoutingMode(),
             isEnabled: enabled,
             isRunning: false,
             endpoint: modelProxyEndpointString(port: port),
@@ -2093,6 +2343,14 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         return stored
     }
 
+    private static func storedModelProxyRoutingMode() -> ModelProxyRoutingMode {
+        let stored = UserDefaults.standard.string(forKey: Preferences.modelProxyRoutingModeKey)
+        guard let stored, let mode = ModelProxyRoutingMode(rawValue: stored) else {
+            return .default
+        }
+        return mode
+    }
+
     private static func normalizedAutoRefreshInterval(_ seconds: Int) -> Int {
         UsageRefreshIntervalOption(rawValue: seconds)?.rawValue ?? UsageRefreshIntervalOption.default.rawValue
     }
@@ -2122,6 +2380,13 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private static func modelProxyCodexBaseURLString(port: Int) -> String {
         modelProxyEndpointString(port: port)
+    }
+
+    private static func isOpenAIProviderKey(_ key: String?) -> Bool {
+        guard let key = key?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
+            return true
+        }
+        return key == "openai"
     }
 
     private static let legacyModelProxyUpstreamBaseURL = "https://api.openai.com/v1"

@@ -67,10 +67,10 @@ Use **Add Profile** in the app to sign in with Codex and save the resulting sess
 The Proxy tab can start a local proxy bound to `127.0.0.1`. By default it exposes:
 
 ```text
-http://127.0.0.1:20128/v1
+http://127.0.0.1:20263/v1
 ```
 
-When enabled, the app updates `~/.codex/config.toml` so Codex routes model requests through the local provider. Reopen Codex once after enabling or changing proxy routing so new chats pick up the local provider. After that, switching profiles in Codex Profiles Bar can reuse the same running proxy because the proxy reads the active saved profile for each proxied request.
+When enabled, the app can route Codex through either a dedicated `codex-profiles-bar` model provider or by overwriting `openai_base_url` in `~/.codex/config.toml`. Reopen Codex once after enabling or changing proxy routing so new chats pick up the selected route. After that, switching profiles in Codex Profiles Bar can reuse the same running proxy because the proxy reads the active saved profile for each proxied request.
 
 Without the proxy, switching profiles still updates the local Codex session, but you should reopen or restart Codex before starting a new chat with the newly selected account.
 
@@ -107,7 +107,7 @@ The scripts generate or refresh the icon assets, build the release binary, creat
 You can override bundle metadata when building:
 
 ```bash
-APP_IDENTIFIER=com.example.codexprofilesbar APP_VERSION=2.0.0 ./scripts/build-app.sh
+APP_IDENTIFIER=com.example.codexprofilesbar APP_VERSION=2.0.2 ./scripts/build-app.sh
 ```
 
 ## Project Structure
