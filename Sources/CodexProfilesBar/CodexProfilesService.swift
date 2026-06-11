@@ -19,6 +19,10 @@ actor CodexProfilesService {
         try await engine.saveCurrent(label: label)
     }
 
+    func installAuth(from source: URL) async throws {
+        try await engine.installAuth(from: source)
+    }
+
     func loadProfile(id: String, mode: SwitchMode) async throws {
         try await engine.loadProfile(id: id, mode: mode)
     }
@@ -62,20 +66,12 @@ actor CodexProfilesService {
         try await engine.copySessionThread(id: id, to: provider)
     }
 
-    func currentModelProviderBaseURL(key: String) async throws -> String? {
-        try await engine.currentModelProviderBaseURL(key: key)
-    }
-
     func setCurrentModelProviderKey(_ value: String?) async throws {
         try await engine.setCurrentModelProviderKey(value)
     }
 
     func setOpenAIBaseURL(_ value: String?) async throws {
         try await engine.setOpenAIBaseURL(value)
-    }
-
-    func upsertModelProxyProviderConfig(key: String, name: String, baseURL: String) async throws {
-        try await engine.upsertModelProxyProviderConfig(key: key, name: name, baseURL: baseURL)
     }
 
     func removeModelProxyProviderConfig(key: String) async throws {

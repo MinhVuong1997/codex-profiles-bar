@@ -9,6 +9,7 @@ struct MenuBarRootView: View {
     @AppStorage(Preferences.showIDsKey) private var showIDs = false
     @AppStorage(Preferences.compactModeKey) private var compactMode = false
     @AppStorage(Preferences.groupingKey) private var groupingRaw = ProfileGrouping.none.rawValue
+    @AppStorage(Preferences.autoSwitchOnDepletionKey) private var autoSwitchOnDepletion = false
     @AppStorage(Preferences.accentRedKey) private var accentRed = 0.15
     @AppStorage(Preferences.accentGreenKey) private var accentGreen = 0.44
     @AppStorage(Preferences.accentBlueKey) private var accentBlue = 0.95
@@ -339,6 +340,15 @@ struct MenuBarRootView: View {
                 .disabled(model.isRefreshButtonLoading)
                 .help(model.isRefreshButtonLoading ? "Refreshing profiles…" : "Refresh profiles")
 
+                Toggle(isOn: $autoSwitchOnDepletion) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                }
+                .toggleStyle(.button)
+                .buttonStyle(IconToggleButtonStyle(isActive: autoSwitchOnDepletion))
+                .help(autoSwitchOnDepletion ? "Auto switch is on" : "Auto switch is off")
+                .accessibilityLabel("Auto switch when depleted")
+                .accessibilityValue(autoSwitchOnDepletion ? "On" : "Off")
+
                 Button {
                     withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
                         showInboxSheet = true
@@ -488,7 +498,7 @@ struct MenuBarRootView: View {
             } else {
                 HStack(spacing: 10) {
                     ProxyStatusBadge(state: model.modelProxyState)
-                    Text(model.modelProxyState.isCodexConfigured ? model.modelProxyState.routingMode.statusDescription : model.modelProxyState.routingMode.inactiveDescription)
+                    Text(model.modelProxyState.isCodexConfigured ? "Codex is routed through the OpenAI base URL." : "Codex is not using the proxy base URL.")
                         .font(.system(.caption, design: .rounded))
                         .foregroundStyle(palette.secondaryText)
                     Spacer(minLength: 0)
@@ -804,7 +814,9 @@ struct MenuBarRootView: View {
 
         sessionThreadSourceID = filteredSessionThreads.first?.id
         if let source = filteredSessionThreads.first {
-            sessionThreadTargetProvider = source.provider == "openai" ? "codex-profiles-bar" : "openai"
+            sessionThreadTargetProvider = source.provider == "openai"
+                ? sessionThreadProviderSuggestions.first(where: { $0 != source.provider }) ?? "openai"
+                : "openai"
         }
     }
 
@@ -842,7 +854,7 @@ struct MenuBarRootView: View {
     }
 
     private var sessionThreadProviderSuggestions: [String] {
-        var providers = ["openai", "codex-profiles-bar"]
+        var providers = ["openai"]
         for provider in model.sessionThreads.map(\.provider) where !providers.contains(provider) && provider != "unknown" {
             providers.append(provider)
         }
@@ -1539,7 +1551,7 @@ struct MenuBarRootView: View {
                         Text("Codex reopen required")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("The proxy routing changed. Reopen Codex once so new chats bind to the current proxy state.")
+                        Text("The proxy base URL changed. Reopen Codex once so new chats bind to the current proxy state.")
                             .font(.system(.caption, design: .rounded))
                             .foregroundStyle(palette.secondaryText)
 
@@ -1570,27 +1582,6 @@ struct MenuBarRootView: View {
                                     .stroke(palette.cardStroke, lineWidth: 1)
                             )
                     )
-                }
-
-                proxySettingsSection(
-                    title: "Routing mode",
-                    systemImage: "point.3.connected.trianglepath.dotted",
-                    description: "Choose how Codex should point at the local proxy."
-                ) {
-                    Picker(
-                        "Routing mode",
-                        selection: Binding(
-                            get: { model.modelProxyState.routingMode },
-                            set: { mode in
-                                Task { await model.setModelProxyRoutingMode(mode) }
-                            }
-                        )
-                    ) {
-                        ForEach(ModelProxyRoutingMode.allCases) { mode in
-                            Text(mode.title).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
                 }
 
                 proxySettingsSection(
@@ -4573,5 +4564,33 @@ struct IconButtonStyle: ButtonStyle {
                 Circle()
                     .fill(configuration.isPressed ? palette.subtleFill.opacity(1.4) : palette.iconFill)
             )
+    }
+}
+
+struct IconToggleButtonStyle: ButtonStyle {
+    let isActive: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    func makeBody(configuration: Configuration) -> some View {
+        let palette = PanelPalette.resolve(for: colorScheme)
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(isActive ? Color.white : palette.primaryText)
+            .frame(width: 26, height: 26)
+            .background(
+                Circle()
+                    .fill(backgroundColor(palette: palette, isPressed: configuration.isPressed))
+            )
+            .overlay(
+                Circle()
+                    .stroke(isActive ? palette.accent.opacity(0.55) : Color.clear, lineWidth: 1)
+            )
+    }
+
+    private func backgroundColor(palette: PanelPalette, isPressed: Bool) -> Color {
+        if isActive {
+            return isPressed ? palette.accentSecondary : palette.accent
+        }
+        return isPressed ? palette.subtleFill.opacity(1.4) : palette.iconFill
     }
 }

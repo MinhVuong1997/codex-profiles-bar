@@ -86,6 +86,20 @@ actor CodexProfilesNativeEngine {
         }
     }
 
+    func installAuth(from source: URL) async throws {
+        let paths = try resolvePaths()
+        try ensurePaths(paths)
+
+        let auth = try readAuthFile(at: source)
+        guard auth.tokens != nil || nonEmpty(auth.openAIAPIKey) != nil else {
+            throw CodexProfilesError.commandFailed("Codex login did not produce a usable auth file.")
+        }
+
+        try withProfilesLock(paths) {
+            try copyAtomicPrivate(from: source, to: paths.auth)
+        }
+    }
+
     func loadProfile(id: String, mode: SwitchMode) async throws {
         let paths = try resolvePaths()
         try ensurePaths(paths)
@@ -273,12 +287,6 @@ actor CodexProfilesNativeEngine {
         )
     }
 
-    func currentModelProviderBaseURL(key: String) throws -> String? {
-        let paths = try resolvePaths()
-        try ensurePaths(paths)
-        return try readSectionConfigValue(paths: paths, section: "model_providers.\(key)", key: "base_url")
-    }
-
     func setCurrentModelProviderKey(_ value: String?) throws {
         let paths = try resolvePaths()
         try ensurePaths(paths)
@@ -299,24 +307,6 @@ actor CodexProfilesNativeEngine {
             contents: contents,
             key: "openai_base_url",
             line: value.map { "openai_base_url = \"\($0)\"" }
-        )
-        try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
-    }
-
-    func upsertModelProxyProviderConfig(key: String, name: String, baseURL: String) throws {
-        let paths = try resolvePaths()
-        try ensurePaths(paths)
-        let contents = (try? String(contentsOf: paths.config, encoding: .utf8)) ?? ""
-        let updated = upsertSection(
-            contents: contents,
-            header: "[model_providers.\(key)]",
-            entries: [
-                "name = \"\(name)\"",
-                "base_url = \"\(baseURL)\"",
-                "wire_api = \"responses\"",
-                "requires_openai_auth = false",
-                "supports_websockets = false",
-            ]
         )
         try writeAtomicPrivate(data: Data(updated.utf8).appendingNewline(), to: paths.config)
     }
@@ -661,6 +651,12 @@ private extension CodexProfilesNativeEngine {
     struct NativeStore {
         var labels: [String: String]
         var index: NativeProfilesIndex
+    }
+
+    struct NativeTokenReplacement {
+        let path: URL
+        let tokens: NativeTokens
+        let modifiedAt: Date
     }
 
     struct NativeProfilesIndex: Codable {
@@ -2141,24 +2137,6 @@ private extension CodexProfilesNativeEngine {
         return parseIntegerConfigValue(value)
     }
 
-    func readSectionConfigValue(paths: NativePaths, section: String, key: String) throws -> String? {
-        guard let contents = try? String(contentsOf: paths.config, encoding: .utf8) else {
-            return nil
-        }
-        var currentSection: String? = nil
-        for line in contents.split(whereSeparator: \.isNewline) {
-            let string = String(line)
-            if let parsedSection = parseSectionHeader(string) {
-                currentSection = parsedSection
-                continue
-            }
-            if currentSection == section, let value = parseConfigValue(string, key: key) {
-                return value
-            }
-        }
-        return nil
-    }
-
     func parseSectionHeader(_ line: String) -> String? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("["), trimmed.hasSuffix("]") else {
@@ -2233,49 +2211,6 @@ private extension CodexProfilesNativeEngine {
         lines.insert(contentsOf: insertedLines, at: firstSectionIndex)
         let joined = lines.joined(separator: "\n")
         return joined
-    }
-
-    func upsertSection(contents: String, header: String, entries: [String]) -> String {
-        let hasTrailingNewline = contents.hasSuffix("\n")
-        var lines = contents.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-
-        let startIndex = lines.firstIndex { $0.trimmingCharacters(in: .whitespacesAndNewlines) == header }
-        if let startIndex {
-            var endIndex = lines.count
-            var cursor = startIndex + 1
-            while cursor < lines.count {
-                if parseSectionHeader(lines[cursor]) != nil {
-                    endIndex = cursor
-                    break
-                }
-                cursor += 1
-            }
-
-            var body = Array(lines[(startIndex + 1)..<endIndex])
-            for entry in entries {
-                guard let separator = entry.firstIndex(of: "=") else { continue }
-                let key = entry[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
-                if let existingIndex = body.firstIndex(where: { isConfigKeyLine($0, key: key) }) {
-                    body[existingIndex] = entry
-                } else {
-                    body.append(entry)
-                }
-            }
-
-            lines.replaceSubrange((startIndex + 1)..<endIndex, with: body)
-            let joined = lines.joined(separator: "\n")
-            return hasTrailingNewline ? joined : joined.trimmingCharacters(in: CharacterSet(charactersIn: "\n"))
-        }
-
-        while !lines.isEmpty && lines.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
-            lines.removeLast()
-        }
-
-        guard !lines.isEmpty else {
-            return header + "\n" + entries.joined(separator: "\n")
-        }
-
-        return lines.joined(separator: "\n") + "\n\n" + header + "\n" + entries.joined(separator: "\n")
     }
 
     func removeSection(contents: String, header: String) -> String {
@@ -2528,6 +2463,7 @@ private extension CodexProfilesNativeEngine {
     }
 
     func refreshProfileTokens(at path: URL, currentTokens: NativeTokens) async throws -> NativeTokens {
+        let paths = try resolvePaths()
         let diskTokens = try readTokens(at: path)
         if diskTokens != currentTokens {
             if sameProfileRefreshTarget(diskTokens, currentTokens) {
@@ -2536,15 +2472,48 @@ private extension CodexProfilesNativeEngine {
             throw CodexProfilesError.commandFailed("Auth state changed while refreshing tokens. Please refresh again.")
         }
 
+        if let replacement = newestTokenReplacement(for: currentTokens, at: path, paths: paths) {
+            try copyAtomicPrivate(from: replacement.path, to: path)
+            return replacement.tokens
+        }
+
         guard let refreshToken = nonEmpty(currentTokens.refreshToken) else {
             throw CodexProfilesError.commandFailed("Saved profile is missing a refresh token.")
         }
 
-        let refreshed = try await refreshAccessToken(refreshToken: refreshToken)
+        let refreshed: NativeRefreshResponse
+        do {
+            refreshed = try await refreshAccessToken(refreshToken: refreshToken)
+        } catch {
+            if let replacement = newestTokenReplacement(for: currentTokens, at: path, paths: paths) {
+                try copyAtomicPrivate(from: replacement.path, to: path)
+                return replacement.tokens
+            }
+            throw error
+        }
         var updatedTokens = currentTokens
         try applyRefresh(into: &updatedTokens, refreshed: refreshed)
         try updateAuthTokens(at: path, refreshed: refreshed)
         return updatedTokens
+    }
+
+    func newestTokenReplacement(for currentTokens: NativeTokens, at path: URL, paths: NativePaths) -> NativeTokenReplacement? {
+        guard extractProfileIdentity(from: currentTokens) != nil else { return nil }
+        let candidates = ([paths.auth] + ((try? profileFiles(in: paths.profiles)) ?? []))
+            .filter { $0.standardizedFileURL.path != path.standardizedFileURL.path }
+
+        return candidates.compactMap { candidate -> NativeTokenReplacement? in
+            guard let tokens = try? readTokens(at: candidate),
+                  tokens != currentTokens,
+                  sameProfileRefreshTarget(tokens, currentTokens),
+                  nonEmpty(tokens.accessToken) != nil || nonEmpty(tokens.refreshToken) != nil else {
+                return nil
+            }
+            let attributes = try? fileManager.attributesOfItem(atPath: candidate.path)
+            let modifiedAt = attributes?[.modificationDate] as? Date ?? .distantPast
+            return NativeTokenReplacement(path: candidate, tokens: tokens, modifiedAt: modifiedAt)
+        }
+        .max { lhs, rhs in lhs.modifiedAt < rhs.modifiedAt }
     }
 
     func sameProfileRefreshTarget(_ lhs: NativeTokens, _ rhs: NativeTokens) -> Bool {

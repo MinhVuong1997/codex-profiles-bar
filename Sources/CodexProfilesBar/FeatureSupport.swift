@@ -318,11 +318,10 @@ extension ProfileStatus {
 
 extension UsageBucket {
     var displayRemainingPercent: Int? {
-        let windows = [fiveHour, weekly].compactMap { $0 }
-        guard let window = windows.min(by: { $0.resetAt < $1.resetAt }) else {
-            return nil
+        if effectiveRemainingPercent == 0 {
+            return 0
         }
-        return window.leftPercent
+        return fiveHour?.leftPercent ?? weekly?.leftPercent
     }
 
     var effectiveRemainingPercent: Int? {

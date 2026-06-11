@@ -21,7 +21,6 @@ enum Preferences {
     static let modelProxyEnabledKey = "CodexProfilesBar.modelProxy.enabled"
     static let modelProxyPortKey = "CodexProfilesBar.modelProxy.port"
     static let modelProxyUpstreamKey = "CodexProfilesBar.modelProxy.upstream"
-    static let modelProxyRoutingModeKey = "CodexProfilesBar.modelProxy.routingMode"
     static let modelProxyPreviousChatGPTBaseURLKey = "CodexProfilesBar.modelProxy.previousChatGPTBaseURL"
     static let modelProxyPreviousModelProviderKey = "CodexProfilesBar.modelProxy.previousModelProvider"
     static let modelProxyPreviousOpenAIBaseURLKey = "CodexProfilesBar.modelProxy.previousOpenAIBaseURL"
@@ -631,7 +630,6 @@ struct ProfileSwitchRecommendation: Equatable {
 }
 
 struct ModelProxyState: Equatable {
-    var routingMode: ModelProxyRoutingMode
     var isEnabled: Bool
     var isRunning: Bool
     var endpoint: String
@@ -648,7 +646,6 @@ struct ModelProxyState: Equatable {
 
     static var disabled: ModelProxyState {
         ModelProxyState(
-            routingMode: .default,
             isEnabled: false,
             isRunning: false,
             endpoint: "http://127.0.0.1:\(defaultPort)/v1",
@@ -678,42 +675,6 @@ struct SessionThreadCopyResult: Equatable {
     let title: String
     let provider: String
     let relativePath: String
-}
-
-enum ModelProxyRoutingMode: String, CaseIterable, Identifiable {
-    case customProvider = "custom_provider"
-    case overwriteOpenAI = "overwrite_openai"
-
-    var id: String { rawValue }
-
-    static let `default` = ModelProxyRoutingMode.customProvider
-
-    var title: String {
-        switch self {
-        case .customProvider:
-            "Custom provider"
-        case .overwriteOpenAI:
-            "Overwrite OpenAI"
-        }
-    }
-
-    var statusDescription: String {
-        switch self {
-        case .customProvider:
-            "Codex is routed through the custom provider."
-        case .overwriteOpenAI:
-            "Codex is routed through the OpenAI base URL."
-        }
-    }
-
-    var inactiveDescription: String {
-        switch self {
-        case .customProvider:
-            "Codex is not using the custom provider."
-        case .overwriteOpenAI:
-            "Codex is not using the proxy base URL."
-        }
-    }
 }
 
 struct ModelProxyCredential: Sendable {

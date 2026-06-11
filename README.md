@@ -70,7 +70,7 @@ The Proxy tab can start a local proxy bound to `127.0.0.1`. By default it expose
 http://127.0.0.1:20263/v1
 ```
 
-When enabled, the app can route Codex through either a dedicated `codex-profiles-bar` model provider or by overwriting `openai_base_url` in `~/.codex/config.toml`. Reopen Codex once after enabling or changing proxy routing so new chats pick up the selected route. After that, switching profiles in Codex Profiles Bar can reuse the same running proxy because the proxy reads the active saved profile for each proxied request.
+When enabled, the app routes Codex by overwriting `openai_base_url` in `~/.codex/config.toml`. Reopen Codex once after enabling or changing the proxy base URL so new chats pick up the selected route. After that, switching profiles in Codex Profiles Bar can reuse the same running proxy because the proxy reads the active saved profile for each proxied request.
 
 Without the proxy, switching profiles still updates the local Codex session, but you should reopen or restart Codex before starting a new chat with the newly selected account.
 
