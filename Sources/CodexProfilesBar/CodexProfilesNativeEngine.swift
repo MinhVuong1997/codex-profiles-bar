@@ -17,6 +17,8 @@ actor CodexProfilesNativeEngine {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 5
         configuration.timeoutIntervalForResource = 5
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
         session = URLSession(configuration: configuration)
     }
 
@@ -2333,10 +2335,13 @@ private extension CodexProfilesNativeEngine {
         for attempt in 0..<usageRetryAttempts {
             do {
                 var request = URLRequest(url: endpoint)
+                request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
                 request.httpMethod = "GET"
                 request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
                 request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
                 request.setValue(usageUserAgent, forHTTPHeaderField: "User-Agent")
+                request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+                request.setValue("no-cache", forHTTPHeaderField: "Pragma")
                 request.setValue("1", forHTTPHeaderField: usageProxyBypassHeader)
 
                 let (data, response) = try await session.data(for: request)
