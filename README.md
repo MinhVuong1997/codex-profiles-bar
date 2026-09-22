@@ -18,9 +18,7 @@ Codex Profiles Bar works directly with the local `~/.codex` storage used by Code
 
 The app is a standalone SwiftUI executable package with no external Swift package dependencies.
 
-Current release: **2.0.4**.
-
-## What's New in 2.0.4
+## Recent Changes
 
 - Manual refresh requests are queued behind an active refresh so the profile list catches up reliably.
 - Profile cards have a cleaner layout, name-only tooltips, improved accessibility labels, and safer accent-color contrast.
