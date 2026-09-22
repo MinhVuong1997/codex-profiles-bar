@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  A native macOS menu bar app for saving, switching, inspecting, importing, and routing multiple Codex profiles.
+  A native macOS menu bar utility for managing multiple Codex accounts from one place.
 </p>
 
 <p align="center">
@@ -14,30 +14,23 @@
 
 ## Overview
 
-Codex Profiles Bar works directly with the local `~/.codex` storage used by Codex. It keeps common profile workflows in the macOS status bar: save the current session, switch accounts, inspect usage, manage saved profiles, review alerts, and optionally route Codex through a local proxy so account switching does not require restarting Codex after the proxy is configured.
+Codex Profiles Bar puts your Codex account profiles in the macOS menu bar. It lets you save multiple signed-in sessions, see their usage status, switch between them, and keep account changes organized without manually replacing files in `~/.codex`.
+
+The app works with Codex's existing local files, so your profiles stay on your Mac. An optional local proxy can keep Codex pointed at one stable endpoint while the active profile changes.
 
 The app is a standalone SwiftUI executable package with no external Swift package dependencies.
-
-## Recent Changes
-
-- Manual refresh requests are queued behind an active refresh so the profile list catches up reliably.
-- Profile cards have a cleaner layout, name-only tooltips, improved accessibility labels, and safer accent-color contrast.
-- Removed the Session Thread Copy workflow and profile sparkline charts.
-- Added an in-app exit confirmation and cleaned up unnecessary UI descriptions.
 
 ## Features
 
 | Area | Details |
 | --- | --- |
-| Profile management | Save the active Codex session, switch profiles, rename labels, clear labels, delete profiles, and repair local storage. |
-| Usage visibility | Inspect remaining usage, usage meters, aggregate stats, warning states, and refresh status from the app UI. |
-| Search and organization | Search profiles, filter by usage or favorites, reorder saved profiles, and open a detached panel view. |
-| Import and export | Preview imported bundles before writing to `~/.codex`, then import or export portable JSON profile bundles. |
-| Alerts | Enable low-usage notifications, review the notification inbox, and optionally auto-switch when a profile is close to depletion. |
-| Model proxy | Run an optional loopback proxy that follows the active profile and exposes an OpenAI-compatible `/v1` endpoint. |
-| UI and accessibility | Use name-only profile tooltips, keyboard navigation, quick switch, accessible labels, and contrast-aware accent colors. |
-| Settings | Configure theme, compact mode, usage refresh behavior, notifications, accent color, proxy settings, and launch at login. |
-| Packaging | Build a signed local `.app` bundle and `.dmg` installer from scripts in this repo. |
+| Manage accounts | Save the active Codex session, switch profiles, rename labels, favorite profiles, delete profiles, and repair local storage. |
+| Monitor usage | View remaining usage, usage meters, aggregate status, warnings, and refresh state for each profile. |
+| Find profiles quickly | Search, filter by usage or favorites, reorder profiles, use keyboard navigation, and open a detached panel. |
+| Import and export | Preview profile bundles before writing them to `~/.codex`, then import or export portable JSON files. |
+| Notifications and automation | Receive low-usage alerts and optionally switch to a healthier saved profile when usage is depleted. |
+| Optional proxy | Run a loopback proxy with an OpenAI-compatible `/v1` endpoint that follows the active profile. |
+| Customization | Choose the theme, compact layout, refresh interval, notification settings, accent color, and launch-at-login behavior. |
 
 ## Requirements
 
@@ -46,9 +39,10 @@ The app is a standalone SwiftUI executable package with no external Swift packag
 - Codex CLI installed and available as `codex`
 - Python 3 with Pillow installed when regenerating icons or running packaging scripts
 
-## Quick Start
+## Get Started
 
-Clone and run the app:
+1. Make sure Codex CLI is installed and available as `codex`.
+2. Build and launch Codex Profiles Bar:
 
 ```bash
 git clone https://github.com/MinhVuong1997/codex-profiles-bar.git CodexProfilesBar
@@ -56,9 +50,12 @@ cd CodexProfilesBar
 swift run
 ```
 
+3. Use **Add Profile** to sign in and save another Codex account, or use **Save Current** to store the session that is already active.
+4. Select a saved profile to switch accounts. If the proxy is disabled, reopen Codex before starting a new chat with the switched account.
+
 You can also open `Package.swift` in Xcode and run the `CodexProfilesBar` executable target.
 
-## Profile Storage
+## How Profiles Are Stored
 
 The app reads and writes the same local Codex home used by the CLI:
 
@@ -68,7 +65,7 @@ The app reads and writes the same local Codex home used by the CLI:
 ~/.codex/profiles/profiles.json
 ```
 
-Use **Add Profile** in the app to sign in with Codex and save the resulting session as a profile. Imported profiles are previewed before anything is written to disk.
+Profile credentials remain in the local Codex directory. Imported profiles are previewed before anything is written to disk.
 
 ## Model Proxy
 
