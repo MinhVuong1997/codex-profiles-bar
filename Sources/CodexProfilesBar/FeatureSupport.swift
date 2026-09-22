@@ -113,6 +113,17 @@ struct PanelPalette {
     let chipStroke: Color
     let iconFill: Color
 
+    var accentForeground: Color {
+        guard let rgb = NSColor(accent).usingColorSpace(.sRGB) else {
+            return .white
+        }
+
+        let luminance = 0.2126 * rgb.redComponent
+            + 0.7152 * rgb.greenComponent
+            + 0.0722 * rgb.blueComponent
+        return luminance > 0.55 ? .black : .white
+    }
+
     static func resolve(for scheme: ColorScheme, accent: Color = AccentTheme.color()) -> PanelPalette {
         let accentSecondary = accent.mix(with: scheme == .dark ? .white.opacity(0.22) : .white.opacity(0.34))
         switch scheme {
@@ -336,13 +347,5 @@ extension UsageBucket {
 
     var nearestResetAt: Int? {
         [fiveHour?.resetAt, weekly?.resetAt].compactMap { $0 }.min()
-    }
-}
-
-extension Array where Element == ProfileUsageHistoryPoint {
-    var sparklinePercentages: [Int] {
-        suffix(18).compactMap { point in
-            point.fiveHourPercent ?? point.weeklyPercent
-        }
     }
 }

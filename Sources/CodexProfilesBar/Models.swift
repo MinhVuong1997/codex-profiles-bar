@@ -660,23 +660,6 @@ struct ModelProxyState: Equatable {
     }
 }
 
-struct SessionThreadSummary: Identifiable, Equatable {
-    let id: String
-    let title: String
-    let provider: String
-    let project: String
-    let projectPath: String
-    let updatedAt: String
-    let relativePath: String
-}
-
-struct SessionThreadCopyResult: Equatable {
-    let id: String
-    let title: String
-    let provider: String
-    let relativePath: String
-}
-
 struct ModelProxyCredential: Sendable {
     enum Kind: String, Sendable {
         case apiKey

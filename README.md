@@ -107,7 +107,7 @@ The scripts generate or refresh the icon assets, build the release binary, creat
 You can override bundle metadata when building:
 
 ```bash
-APP_IDENTIFIER=com.example.codexprofilesbar APP_VERSION=2.0.3 ./scripts/build-app.sh
+APP_IDENTIFIER=com.example.codexprofilesbar APP_VERSION=2.0.4 ./scripts/build-app.sh
 ```
 
 ## Project Structure

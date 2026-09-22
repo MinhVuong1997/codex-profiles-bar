@@ -19,6 +19,7 @@ struct MenuBarRootView: View {
     @State private var showSaveSheet = false
     @State private var showDoctorSheet = false
     @State private var showInboxSheet = false
+    @State private var showExitConfirmation = false
     @State private var showQuickSwitch = false
     @State private var selectedFilter: ProfileFilter = .all
     @State private var searchText = ""
@@ -44,11 +45,6 @@ struct MenuBarRootView: View {
     @State private var modelProxyEndpointSaveTask: Task<Void, Never>?
     @State private var modelContextWindowText = ""
     @State private var modelTokenLimitPercentText = ""
-    @State private var sessionThreadSourceID: String?
-    @State private var sessionThreadSearchText = ""
-    @State private var sessionThreadProviderFilter = "all"
-    @State private var sessionThreadProjectFilter = "all"
-    @State private var sessionThreadTargetProvider = "openai"
     private let scrollTopAnchorID = "profiles-scroll-top"
 
     private var palette: PanelPalette {
@@ -189,6 +185,17 @@ struct MenuBarRootView: View {
                 .zIndex(3)
             }
 
+            if showExitConfirmation {
+                ExitConfirmationOverlay {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.84)) {
+                        showExitConfirmation = false
+                    }
+                }
+                .padding(14)
+                .transition(.scale(scale: 0.96).combined(with: .opacity))
+                .zIndex(3)
+            }
+
         }
         .environment(\.colorScheme, resolvedColorScheme)
         .animation(.spring(response: 0.32, dampingFraction: 0.84), value: model.banner?.id)
@@ -214,10 +221,6 @@ struct MenuBarRootView: View {
             ensureValidSelection()
             requestTopScroll()
             loadModelProxySettingsDraft()
-            Task {
-                await model.refreshSessionThreads()
-                loadSessionThreadCopyDraft()
-            }
         }
         .onDisappear {
             removeLocalKeyMonitor()
@@ -237,25 +240,9 @@ struct MenuBarRootView: View {
                 loadModelProxySettingsDraft()
             }
         }
-        .onChange(of: model.sessionThreads) { _, _ in
-            loadSessionThreadCopyDraft()
-        }
-        .onChange(of: sessionThreadSearchText) { _, _ in
-            loadSessionThreadCopyDraft()
-        }
-        .onChange(of: sessionThreadProviderFilter) { _, _ in
-            loadSessionThreadCopyDraft()
-        }
-        .onChange(of: sessionThreadProjectFilter) { _, _ in
-            loadSessionThreadCopyDraft()
-        }
         .onChange(of: selectedMainTab) { _, nextTab in
             if nextTab == .proxy {
                 loadModelProxySettingsDraft()
-                Task {
-                    await model.refreshSessionThreads()
-                    loadSessionThreadCopyDraft()
-                }
             } else {
                 modelProxyEndpointSaveTask?.cancel()
                 modelProxyEndpointSaveTask = nil
@@ -294,6 +281,7 @@ struct MenuBarRootView: View {
         if deleteTarget != nil { return "delete" }
         if !bulkDeleteTargets.isEmpty { return "bulk-delete" }
         if switchTarget != nil { return "switch" }
+        if showExitConfirmation { return "exit" }
         return nil
     }
 
@@ -315,6 +303,8 @@ struct MenuBarRootView: View {
                 showInboxSheet = false
             } else if showDoctorSheet {
                 showDoctorSheet = false
+            } else if showExitConfirmation {
+                showExitConfirmation = false
             }
         }
     }
@@ -339,6 +329,7 @@ struct MenuBarRootView: View {
                 }
                 .disabled(model.isRefreshButtonLoading)
                 .help(model.isRefreshButtonLoading ? "Refreshing profiles…" : "Refresh profiles")
+                .accessibilityLabel("Refresh profiles")
 
                 Toggle(isOn: $autoSwitchOnDepletion) {
                     Image(systemName: "arrow.triangle.2.circlepath")
@@ -369,6 +360,8 @@ struct MenuBarRootView: View {
                 }
                 .buttonStyle(IconButtonStyle())
                 .help(model.unreadInboxCount > 0 ? "Open inbox (\(model.unreadInboxCount) unread)" : "Open notification inbox")
+                .accessibilityLabel("Open notification inbox")
+                .accessibilityValue(model.unreadInboxCount > 0 ? "\(model.unreadInboxCount) unread" : "No unread notifications")
 
                 if !isDetached {
                     Button {
@@ -378,6 +371,7 @@ struct MenuBarRootView: View {
                     }
                     .buttonStyle(IconButtonStyle())
                     .help("Open detachable panel")
+                    .accessibilityLabel("Open detachable panel")
                 }
 
                 Button {
@@ -387,14 +381,16 @@ struct MenuBarRootView: View {
                 }
                 .buttonStyle(IconButtonStyle())
                 .help("Open settings")
+                .accessibilityLabel("Open settings")
 
                 Button {
-                    NSApp.terminate(nil)
+                    showExitConfirmation = true
                 } label: {
                     Image(systemName: "power")
                 }
                 .buttonStyle(IconButtonStyle())
                 .help("Exit app")
+                .accessibilityLabel("Exit Codex Profiles Bar")
 
             }
         }
@@ -481,7 +477,7 @@ struct MenuBarRootView: View {
                     } label: {
                         Text(bulkSelectionMode ? "Done" : "Select")
                             .font(.system(.caption, design: .rounded, weight: .bold))
-                            .foregroundStyle(bulkSelectionMode ? Color.white : palette.primaryText)
+                            .foregroundStyle(bulkSelectionMode ? palette.accentForeground : palette.primaryText)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 10)
                             .background(
@@ -596,7 +592,6 @@ struct MenuBarRootView: View {
                                     profile: currentProfile,
                                     showID: showIDs,
                                     isFavorite: model.isFavorite(currentProfile),
-                                    sparklineValues: model.usageHistoryByProfileID[currentProfile.id ?? ""]?.sparklinePercentages ?? [],
                                     healthBadges: healthBadges(for: currentProfile),
                                     recommendation: model.recommendedSwitch,
                                     onToggleFavorite: {
@@ -664,7 +659,6 @@ struct MenuBarRootView: View {
                                             showID: showIDs,
                                             isFavorite: model.isFavorite(profile),
                                             isCompact: compactMode,
-                                            sparklineValues: model.usageHistoryByProfileID[profile.id ?? ""]?.sparklinePercentages ?? [],
                                             healthBadges: healthBadges(for: profile),
                                             isSelected: selectedProfileID == profile.stableID,
                                             isBulkMode: bulkSelectionMode,
@@ -804,61 +798,6 @@ struct MenuBarRootView: View {
         } else {
             modelTokenLimitPercentText = ""
         }
-    }
-
-    private func loadSessionThreadCopyDraft() {
-        if let sessionThreadSourceID,
-           filteredSessionThreads.contains(where: { $0.id == sessionThreadSourceID }) {
-            return
-        }
-
-        sessionThreadSourceID = filteredSessionThreads.first?.id
-        if let source = filteredSessionThreads.first {
-            sessionThreadTargetProvider = source.provider == "openai"
-                ? sessionThreadProviderSuggestions.first(where: { $0 != source.provider }) ?? "openai"
-                : "openai"
-        }
-    }
-
-    private var filteredSessionThreads: [SessionThreadSummary] {
-        let query = sessionThreadSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return model.sessionThreads.filter { thread in
-            let matchesProvider = sessionThreadProviderFilter == "all" || thread.provider == sessionThreadProviderFilter
-            let matchesProject = sessionThreadProjectFilter == "all" || thread.project == sessionThreadProjectFilter
-            guard matchesProvider && matchesProject else { return false }
-            guard !query.isEmpty else { return true }
-
-            return thread.title.lowercased().contains(query)
-                || thread.provider.lowercased().contains(query)
-                || thread.project.lowercased().contains(query)
-                || thread.projectPath.lowercased().contains(query)
-                || thread.id.lowercased().contains(query)
-                || thread.relativePath.lowercased().contains(query)
-        }
-    }
-
-    private var sessionThreadProviderFilters: [String] {
-        var providers = ["all"]
-        for provider in model.sessionThreads.map(\.provider) where !providers.contains(provider) {
-            providers.append(provider)
-        }
-        return providers
-    }
-
-    private var sessionThreadProjectFilters: [String] {
-        var projects = ["all"]
-        for project in model.sessionThreads.map(\.project) where !projects.contains(project) {
-            projects.append(project)
-        }
-        return projects
-    }
-
-    private var sessionThreadProviderSuggestions: [String] {
-        var providers = ["openai"]
-        for provider in model.sessionThreads.map(\.provider) where !providers.contains(provider) && provider != "unknown" {
-            providers.append(provider)
-        }
-        return Array(providers.prefix(6))
     }
 
     private func scheduleModelProxyEndpointSave() {
@@ -1348,7 +1287,7 @@ struct MenuBarRootView: View {
                     } label: {
                         Text(filter.title)
                             .font(.system(.caption, design: .rounded, weight: .bold))
-                            .foregroundStyle(selectedFilter == filter ? Color.white : palette.secondaryText)
+                            .foregroundStyle(selectedFilter == filter ? palette.accentForeground : palette.secondaryText)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 8)
                             .frame(minWidth: filter == .hasUsage ? 90 : 74)
@@ -1412,7 +1351,7 @@ struct MenuBarRootView: View {
                             Text(tab.title)
                                 .font(.system(.caption, design: .rounded, weight: .bold))
                         }
-                        .foregroundStyle(selectedMainTab == tab ? Color.white : palette.secondaryText)
+                        .foregroundStyle(selectedMainTab == tab ? palette.accentForeground : palette.secondaryText)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 8)
                         .frame(minWidth: 90)
@@ -1477,7 +1416,7 @@ struct MenuBarRootView: View {
         HStack(spacing: 6) {
             Image(systemName: "rectangle.stack")
                 .font(.system(size: 11, weight: .semibold))
-            Text("\(filteredProfiles.count) profiles")
+            Text("\(navigableProfiles.count) profiles")
                 .font(.system(.caption, design: .rounded, weight: .bold))
         }
             .foregroundStyle(palette.primaryText.opacity(0.88))
@@ -1491,7 +1430,7 @@ struct MenuBarRootView: View {
                             .stroke(palette.cardStroke, lineWidth: 1)
                     )
             )
-            .accessibilityLabel("\(filteredProfiles.count) filtered profiles")
+            .accessibilityLabel("\(navigableProfiles.count) profiles in the list")
     }
 
     private var proxyDashboardCard: some View {
@@ -1506,9 +1445,6 @@ struct MenuBarRootView: View {
                         Text("Run local proxy")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("Use the active profile for Codex requests.")
-                            .font(.system(.caption, design: .rounded))
-                            .foregroundStyle(palette.secondaryText)
                     }
 
                     Spacer()
@@ -1551,7 +1487,7 @@ struct MenuBarRootView: View {
                         Text("Codex reopen required")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("The proxy base URL changed. Reopen Codex once so new chats bind to the current proxy state.")
+                        Text("The proxy or model settings changed. Reopen Codex once so new chats use the current configuration.")
                             .font(.system(.caption, design: .rounded))
                             .foregroundStyle(palette.secondaryText)
 
@@ -1585,116 +1521,9 @@ struct MenuBarRootView: View {
                 }
 
                 proxySettingsSection(
-                    title: "Session thread copy",
-                    systemImage: "doc.on.doc",
-                    description: "Duplicate a saved Codex thread under another model provider."
-                ) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        if model.isLoadingSessionThreads {
-                            ProgressView("Loading threads…")
-                                .controlSize(.small)
-                        } else if model.sessionThreads.isEmpty {
-                            Text("No local Codex session threads were found.")
-                                .font(.system(.caption, design: .rounded))
-                                .foregroundStyle(palette.secondaryText)
-                        } else {
-                            VStack(alignment: .leading, spacing: 8) {
-                                proxyField(title: "Search source", placeholder: "Title, project, provider, ID, path", text: $sessionThreadSearchText)
-
-                                HStack(alignment: .bottom, spacing: 10) {
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        Text("Provider")
-                                            .font(.system(.caption2, design: .rounded, weight: .bold))
-                                            .foregroundStyle(palette.secondaryText)
-                                        Picker(
-                                            "Provider",
-                                            selection: $sessionThreadProviderFilter
-                                        ) {
-                                            ForEach(sessionThreadProviderFilters, id: \.self) { provider in
-                                                Text(provider == "all" ? "All" : provider).tag(provider)
-                                            }
-                                        }
-                                        .pickerStyle(.menu)
-                                        .labelsHidden()
-                                        .frame(width: 150)
-                                    }
-
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        Text("Project")
-                                            .font(.system(.caption2, design: .rounded, weight: .bold))
-                                            .foregroundStyle(palette.secondaryText)
-                                        Picker(
-                                            "Project",
-                                            selection: $sessionThreadProjectFilter
-                                        ) {
-                                            ForEach(sessionThreadProjectFilters, id: \.self) { project in
-                                                Text(project == "all" ? "All" : project).tag(project)
-                                            }
-                                        }
-                                        .pickerStyle(.menu)
-                                        .labelsHidden()
-                                        .frame(width: 180)
-                                    }
-                                }
-                            }
-
-                            Picker(
-                                "Source thread",
-                                selection: Binding(
-                                    get: { sessionThreadSourceID ?? filteredSessionThreads.first?.id ?? "" },
-                                    set: { sessionThreadSourceID = $0 }
-                                )
-                            ) {
-                                ForEach(filteredSessionThreads) { thread in
-                                    Text("\(thread.title) • \(thread.project) • \(thread.provider)").tag(thread.id)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .disabled(filteredSessionThreads.isEmpty)
-
-                            if filteredSessionThreads.isEmpty {
-                                Text("No source threads match the current search.")
-                                    .font(.system(.caption, design: .rounded))
-                                    .foregroundStyle(palette.secondaryText)
-                            }
-
-                            HStack(alignment: .bottom, spacing: 10) {
-                                proxyField(title: "Destination provider", placeholder: "openai", text: $sessionThreadTargetProvider)
-
-                                Button {
-                                    Task {
-                                        _ = await model.copySessionThread(id: sessionThreadSourceID, to: sessionThreadTargetProvider)
-                                        loadSessionThreadCopyDraft()
-                                    }
-                                } label: {
-                                    if model.isCopyingSessionThread {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                    } else {
-                                        Label("Copy", systemImage: "doc.on.doc")
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(model.isCopyingSessionThread || sessionThreadSourceID == nil || filteredSessionThreads.isEmpty)
-                            }
-
-                            HStack(spacing: 6) {
-                                ForEach(sessionThreadProviderSuggestions, id: \.self) { provider in
-                                    Button(provider) {
-                                        sessionThreadTargetProvider = provider
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.mini)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                proxySettingsSection(
                     title: "Endpoint settings",
                     systemImage: "network",
-                    description: "This port creates the local Codex endpoint."
+                    description: nil
                 ) {
                     HStack(alignment: .top, spacing: 10) {
                         proxyField(title: "Local port", placeholder: "\(ModelProxyState.defaultPort)", text: $modelProxyPortText, width: 132)
@@ -1707,7 +1536,7 @@ struct MenuBarRootView: View {
                 proxySettingsSection(
                     title: "Model limits",
                     systemImage: "dial.high",
-                    description: "Context window sets the token budget. Auto-compact starts when usage reaches that percent."
+                    description: nil
                 ) {
                     HStack(alignment: .top, spacing: 10) {
                         proxyField(title: "Context window", placeholder: "400000", text: $modelContextWindowText)
@@ -1748,7 +1577,7 @@ struct MenuBarRootView: View {
     private func proxySettingsSection<Content: View>(
         title: String,
         systemImage: String,
-        description: String,
+        description: String?,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1756,10 +1585,12 @@ struct MenuBarRootView: View {
                 .font(.system(.subheadline, design: .rounded, weight: .bold))
                 .foregroundStyle(palette.primaryText)
 
-            Text(description)
-                .font(.system(.caption, design: .rounded))
-                .foregroundStyle(palette.secondaryText)
-                .fixedSize(horizontal: false, vertical: true)
+            if let description, !description.isEmpty {
+                Text(description)
+                    .font(.system(.caption, design: .rounded))
+                    .foregroundStyle(palette.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             content()
         }
@@ -1880,7 +1711,6 @@ struct ProfileCard: View {
     let showID: Bool
     let isFavorite: Bool
     let isCompact: Bool
-    let sparklineValues: [Int]
     let healthBadges: [ProfileHealthBadgeDescriptor]
     let isSelected: Bool
     let isBulkMode: Bool
@@ -1930,6 +1760,7 @@ struct ProfileCard: View {
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
                             .lineLimit(1)
+                            .help(profile.primaryText)
                         statusChip
                         if let percent = profile.usageDisplayPercent {
                             Text("\(percent)%")
@@ -1969,21 +1800,6 @@ struct ProfileCard: View {
 
                 VStack(alignment: .trailing, spacing: isCompact ? 10 : 12) {
                     HStack(spacing: 10) {
-                        if shouldShowSparkline {
-                            SparklineView(values: sparklineValues, color: toneColor)
-                                .frame(width: 54, height: 18)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .background(
-                                    Capsule()
-                                        .fill(palette.subtleFill)
-                                        .overlay(
-                                            Capsule()
-                                                .stroke(palette.cardStroke, lineWidth: 1)
-                                        )
-                                )
-                        }
-
                         Button(action: onToggleFavorite) {
                             Image(systemName: isFavorite ? "star.fill" : "star")
                                 .font(.system(size: 13, weight: .semibold))
@@ -1991,13 +1807,59 @@ struct ProfileCard: View {
                         }
                         .buttonStyle(.plain)
                         .help(isFavorite ? "Remove favorite" : "Add favorite")
+                        .accessibilityLabel(isFavorite ? "Remove favorite" : "Add favorite")
+
+                        if !isBulkMode {
+                            Menu {
+                                if profile.isSaved {
+                                    Button(isFavorite ? "Remove favorite" : "Add favorite", systemImage: isFavorite ? "star.slash" : "star") {
+                                        onToggleFavorite()
+                                    }
+                                    Button("Edit label", systemImage: "pencil") {
+                                        onEditLabel()
+                                    }
+
+                                    if profile.label != nil {
+                                        Button("Clear label", systemImage: "tag.slash") {
+                                            onClearLabel()
+                                        }
+                                        .disabled(isClearingLabel)
+                                    }
+
+                                    Button("Export JSON", systemImage: "square.and.arrow.up") {
+                                        onExport()
+                                    }
+
+                                    Divider()
+
+                                    Button("Delete profile", systemImage: "trash", role: .destructive) {
+                                        onDelete()
+                                    }
+                                } else {
+                                    Text("Save current session first")
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "ellipsis.circle")
+                                        .font(.system(size: 16, weight: .medium))
+                                    Image(systemName: "chevron.down")
+                                        .font(.system(size: 10, weight: .bold))
+                                }
+                                .foregroundStyle(palette.primaryText.opacity(0.92))
+                                .padding(.horizontal, 2)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .menuIndicator(.hidden)
+                            .fixedSize()
+                            .accessibilityLabel("More actions for \(profile.primaryText)")
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .trailing)
 
                     if isBulkMode {
                         Text(isBulkSelected ? "Selected" : "Select")
                             .font(.system(.caption, design: .rounded, weight: .semibold))
-                            .foregroundStyle(isBulkSelected ? Color.white : palette.secondaryText)
+                            .foregroundStyle(isBulkSelected ? palette.accentForeground : palette.secondaryText)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
                             .background(
@@ -2036,49 +1898,6 @@ struct ProfileCard: View {
                             .background(palette.subtleFill, in: Capsule())
                     }
 
-                    if !isBulkMode {
-                        Menu {
-                            if profile.isSaved {
-                                Button(isFavorite ? "Remove favorite" : "Add favorite", systemImage: isFavorite ? "star.slash" : "star") {
-                                    onToggleFavorite()
-                                }
-                                Button("Edit label", systemImage: "pencil") {
-                                    onEditLabel()
-                                }
-
-                                if profile.label != nil {
-                                    Button("Clear label", systemImage: "tag.slash") {
-                                        onClearLabel()
-                                    }
-                                    .disabled(isClearingLabel)
-                                }
-
-                                Button("Export JSON", systemImage: "square.and.arrow.up") {
-                                    onExport()
-                                }
-
-                                Divider()
-
-                                Button("Delete profile", systemImage: "trash", role: .destructive) {
-                                    onDelete()
-                                }
-                            } else {
-                                Text("Save current session first")
-                            }
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "ellipsis.circle")
-                                    .font(.system(size: 16, weight: .medium))
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 10, weight: .bold))
-                            }
-                            .foregroundStyle(palette.primaryText.opacity(0.92))
-                            .padding(.horizontal, 2)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .menuIndicator(.hidden)
-                        .fixedSize()
-                    }
                 }
                 .frame(minWidth: 112, alignment: .trailing)
             }
@@ -2145,10 +1964,6 @@ struct ProfileCard: View {
             return palette.accent.opacity(0.9)
         }
         return toneColor.opacity(0.35)
-    }
-
-    private var shouldShowSparkline: Bool {
-        sparklineValues.count >= 3
     }
 
     private var secondaryStateLabel: String {
@@ -2229,7 +2044,6 @@ struct ActiveProfileSpotlightCard: View {
     let profile: ProfileStatus
     let showID: Bool
     let isFavorite: Bool
-    let sparklineValues: [Int]
     let healthBadges: [ProfileHealthBadgeDescriptor]
     let recommendation: ProfileSwitchRecommendation?
     let onToggleFavorite: () -> Void
@@ -2272,27 +2086,14 @@ struct ActiveProfileSpotlightCard: View {
                 Spacer()
 
                 HStack(spacing: 8) {
-                    if sparklineValues.count >= 3 {
-                        SparklineView(values: sparklineValues, color: palette.success)
-                            .frame(width: 62, height: 20)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule()
-                                    .fill(palette.subtleFill)
-                                    .overlay(
-                                        Capsule()
-                                            .stroke(palette.cardStroke, lineWidth: 1)
-                                    )
-                            )
-                    }
-
                     Button(action: onToggleFavorite) {
                         Image(systemName: isFavorite ? "star.fill" : "star")
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(isFavorite ? palette.warning : palette.secondaryText)
                     }
                     .buttonStyle(.plain)
+                    .help(isFavorite ? "Remove favorite" : "Add favorite")
+                    .accessibilityLabel(isFavorite ? "Remove favorite" : "Add favorite")
                 }
             }
 
@@ -2480,41 +2281,6 @@ struct AggregateUsageCard: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.subtleFill)
         )
-    }
-}
-
-struct SparklineView: View {
-    let values: [Int]
-    let color: Color
-
-    var body: some View {
-        GeometryReader { proxy in
-            let points = normalizedPoints(in: proxy.size)
-            Path { path in
-                guard let first = points.first else { return }
-                path.move(to: first)
-                for point in points.dropFirst() {
-                    path.addLine(to: point)
-                }
-            }
-            .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-        }
-    }
-
-    private func normalizedPoints(in size: CGSize) -> [CGPoint] {
-        guard !values.isEmpty else { return [] }
-        if values.count == 1 {
-            return [CGPoint(x: 0, y: size.height / 2), CGPoint(x: size.width, y: size.height / 2)]
-        }
-
-        let clamped = values.map { CGFloat(max(0, min(100, $0))) }
-        let stepX = size.width / CGFloat(max(clamped.count - 1, 1))
-        return clamped.enumerated().map { index, value in
-            CGPoint(
-                x: CGFloat(index) * stepX,
-                y: size.height - (value / 100) * size.height
-            )
-        }
     }
 }
 
@@ -3040,6 +2806,35 @@ struct EditLabelOverlay: View {
                     .disabled(isSaving)
                 }
                 .animation(.easeInOut(duration: 0.18), value: isSaving)
+            }
+            .frame(width: 336)
+        }
+    }
+}
+
+struct ExitConfirmationOverlay: View {
+    let onClose: () -> Void
+
+    var body: some View {
+        OverlayCard {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Exit Codex Profiles Bar?")
+                    .font(.system(.title3, design: .rounded, weight: .bold))
+
+                Text("The app will stop monitoring and refreshing profiles.")
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Spacer()
+                    Button("Cancel") {
+                        onClose()
+                    }
+                    Button("Exit", role: .destructive) {
+                        NSApp.terminate(nil)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .tint(.red)
+                }
             }
             .frame(width: 336)
         }
@@ -3726,9 +3521,6 @@ struct SettingsView: View {
                             Text("Open automatically after login")
                                 .font(.system(.headline, design: .rounded, weight: .semibold))
                                 .foregroundStyle(palette.primaryText)
-                            Text(model.launchAtLoginState.detail)
-                                .font(.system(.caption, design: .rounded))
-                                .foregroundStyle(palette.secondaryText)
                         }
                     }
                     .toggleStyle(.switch)
@@ -3751,7 +3543,7 @@ struct SettingsView: View {
         SettingsCard(
             eyebrow: "Storage",
             title: "Codex Storage",
-            detail: "Uses your local Codex session directly from ~/.codex."
+            detail: nil
         ) {
             VStack(alignment: .leading, spacing: 12) {
                 if let detected = model.detectedStorage {
@@ -3768,9 +3560,6 @@ struct SettingsView: View {
                     isMonospaced: true
                 )
 
-                Text("If profiles do not appear, sign in once with `codex login` so ~/.codex/auth.json is available.")
-                    .font(.system(.caption, design: .rounded))
-                    .foregroundStyle(palette.secondaryText)
             }
         }
     }
@@ -3835,7 +3624,7 @@ struct SettingsView: View {
                         Text("Compact mode")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("Dense list layout that hides usage bars and keeps sparkline + key status only.")
+                        Text("Dense list layout that hides usage bars and keeps key status only.")
                             .font(.system(.caption, design: .rounded))
                             .foregroundStyle(palette.secondaryText)
                     }
@@ -4420,9 +4209,12 @@ struct RefreshActivityBadge: View {
                 Text("Refreshing")
                     .font(.system(.caption2, design: .monospaced, weight: .bold))
                     .foregroundStyle(palette.success)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
+            .fixedSize(horizontal: true, vertical: false)
             .background(palette.subtleFill, in: Capsule())
             .transition(.opacity.combined(with: .scale))
         }
@@ -4575,7 +4367,7 @@ struct IconToggleButtonStyle: ButtonStyle {
         let palette = PanelPalette.resolve(for: colorScheme)
         configuration.label
             .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(isActive ? Color.white : palette.primaryText)
+            .foregroundStyle(isActive ? palette.accentForeground : palette.primaryText)
             .frame(width: 26, height: 26)
             .background(
                 Circle()

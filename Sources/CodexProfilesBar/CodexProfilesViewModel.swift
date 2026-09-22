@@ -46,10 +46,6 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     @Published private(set) var activeImportPreview: PendingImportPreview?
     @Published private(set) var modelProxyState = ModelProxyState.disabled
     @Published private(set) var modelProxyRuntimeModel = ModelProxyRuntimeModel(name: "gpt-5.5", contextWindow: nil, autoCompactTokenLimit: nil)
-    @Published private(set) var sessionThreads: [SessionThreadSummary] = []
-    @Published private(set) var isLoadingSessionThreads = false
-    @Published private(set) var isCopyingSessionThread = false
-    @Published private(set) var lastSessionThreadCopy: SessionThreadCopyResult?
     @Published var banner: BannerMessage?
 
     private let service = CodexProfilesService.shared
@@ -71,6 +67,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private var autoRefreshTask: Task<Void, Never>?
     private var proxyRefreshTask: Task<Void, Never>?
     private var switchReconcileTask: Task<Void, Never>?
+    private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
     private var codexLoginProcess: Process?
     private var isCodexLoginCancelled = false
     private var favorites: [String]
@@ -82,6 +79,12 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private var isPerformingAutomaticSwitch = false
     private var isSwitchingAfterCodexClose = false
     private var presentedUpdateVersion: String?
+    private var pendingModelProxyRuntimeSettings: PendingModelProxyRuntimeSettings?
+
+    private struct PendingModelProxyRuntimeSettings {
+        let contextWindow: Int?
+        let autoCompactTokenLimit: Int?
+    }
     override init() {
         let storedAutoRefresh = UserDefaults.standard.object(forKey: Preferences.autoRefreshKey) as? Bool
         isAutoRefreshEnabled = storedAutoRefresh ?? true
@@ -96,7 +99,6 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         Task {
             await refreshModelProxyRoutingState()
             await refreshModelProxyRuntimeModel()
-            await refreshSessionThreads()
             if modelProxyState.isEnabled {
                 try? await syncCodexRoutingToProxyEnabledState(true)
                 await startModelProxy(shouldShowBanner: false)
@@ -208,48 +210,6 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     func setAutoRefreshInterval(_ seconds: Int) {
         UserDefaults.standard.set(Self.normalizedAutoRefreshInterval(seconds), forKey: Preferences.autoRefreshIntervalKey)
         configureAllProfilesAutoRefreshLoop()
-    }
-
-    func refreshSessionThreads() async {
-        isLoadingSessionThreads = true
-        defer { isLoadingSessionThreads = false }
-
-        do {
-            sessionThreads = try await service.fetchSessionThreads()
-        } catch {
-            showBanner(title: "Could not load session threads", body: error.localizedDescription, tone: .error)
-        }
-    }
-
-    func copySessionThread(id: String?, to provider: String) async -> Bool {
-        guard let id, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            showBanner(title: "Choose a thread", body: "Select a source session thread to copy.", tone: .error)
-            return false
-        }
-
-        let targetProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !targetProvider.isEmpty else {
-            showBanner(title: "Choose a provider", body: "Enter the destination model provider.", tone: .error)
-            return false
-        }
-
-        isCopyingSessionThread = true
-        defer { isCopyingSessionThread = false }
-
-        do {
-            let result = try await service.copySessionThread(id: id, to: targetProvider)
-            lastSessionThreadCopy = result
-            await refreshSessionThreads()
-            showBanner(
-                title: "Session thread copied",
-                body: "Created \(result.title) for \(result.provider).",
-                tone: .success
-            )
-            return true
-        } catch {
-            showBanner(title: "Could not copy thread", body: error.localizedDescription, tone: .error)
-            return false
-        }
     }
 
     func refreshModelProxyRuntimeModel() async {
@@ -388,6 +348,11 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 contextWindow: contextWindow,
                 autoCompactTokenLimit: autoCompactTokenLimit
             )
+            pendingModelProxyRuntimeSettings = PendingModelProxyRuntimeSettings(
+                contextWindow: contextWindow,
+                autoCompactTokenLimit: autoCompactTokenLimit
+            )
+            modelProxyState.requiresCodexRelaunch = true
             let body: String
             if let contextWindow, let tokenLimitPercent, let autoCompactTokenLimit {
                 body = "Context window set to \(contextWindow.formatted()) with auto-compact at \(tokenLimitPercent)% (\(autoCompactTokenLimit.formatted()) tokens)."
@@ -494,6 +459,11 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func performRefresh(trigger: RefreshTrigger, scope: RefreshScope) async {
         if isRefreshingProfiles {
+            guard trigger != .automatic else { return }
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                refreshWaiters.append(continuation)
+            }
+            await performRefresh(trigger: trigger, scope: scope)
             return
         }
         if trigger == .automatic && isLoading {
@@ -509,6 +479,9 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             if trigger != .automatic {
                 isLoading = false
             }
+            let waiters = refreshWaiters
+            refreshWaiters.removeAll()
+            waiters.forEach { $0.resume() }
         }
 
         do {
@@ -2238,7 +2211,8 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         defer { isRestartingCodex = false }
 
         do {
-            try await restartCodexApplication()
+            try await restartCodexApplication(reapplying: pendingModelProxyRuntimeSettings)
+            pendingModelProxyRuntimeSettings = nil
             modelProxyState.requiresCodexRelaunch = false
             showBanner(
                 title: "Codex reopened",
@@ -2381,7 +2355,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         return nil
     }
 
-    private func restartCodexApplication() async throws {
+    private func restartCodexApplication(reapplying settings: PendingModelProxyRuntimeSettings?) async throws {
         if let appURL = resolveCodexAppURL() {
             let bundleID = Bundle(url: appURL)?.bundleIdentifier ?? "com.openai.codex"
             let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
@@ -2396,6 +2370,8 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 }
                 try? await Task.sleep(for: .milliseconds(250))
             }
+
+            try await reapplyModelProxyRuntimeSettings(settings)
 
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = true
@@ -2413,6 +2389,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
 
         if let executable = resolveCodexExecutablePath() {
+            try await reapplyModelProxyRuntimeSettings(settings)
             let process = Process()
             process.executableURL = executable
             process.arguments = ["app", currentWorkspaceURL().path]
@@ -2421,6 +2398,14 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
 
         throw CodexProfilesError.commandFailed("Install Codex.app or make the `codex` command available to reopen it automatically.")
+    }
+
+    private func reapplyModelProxyRuntimeSettings(_ settings: PendingModelProxyRuntimeSettings?) async throws {
+        guard let settings else { return }
+        modelProxyRuntimeModel = try await service.setModelProxyRuntimeModel(
+            contextWindow: settings.contextWindow,
+            autoCompactTokenLimit: settings.autoCompactTokenLimit
+        )
     }
 
     private func resolveCodexAppURL() -> URL? {
