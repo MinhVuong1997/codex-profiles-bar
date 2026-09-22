@@ -14,9 +14,9 @@
 
 ## Overview
 
-Codex Profiles Bar puts your Codex account profiles in the macOS menu bar. It lets you save multiple signed-in sessions, see their usage status, switch between them, and keep account changes organized without manually replacing files in `~/.codex`.
+Codex Profiles Bar puts your Codex account profiles in the macOS menu bar. It lets you manage multiple signed-in accounts, see their usage status, and switch between them without manually replacing files in `~/.codex`.
 
-The app works with Codex's existing local files, so your profiles stay on your Mac. An optional local proxy can keep Codex pointed at one stable endpoint while the active profile changes.
+The app works with Codex's existing local files, so your profiles stay on your Mac. When the local proxy is enabled, you can switch accounts without restarting Codex or the app.
 
 The app is a standalone SwiftUI executable package with no external Swift package dependencies.
 
@@ -24,12 +24,12 @@ The app is a standalone SwiftUI executable package with no external Swift packag
 
 | Area | Details |
 | --- | --- |
-| Manage accounts | Save the active Codex session, switch profiles, rename labels, favorite profiles, delete profiles, and repair local storage. |
+| Manage accounts | Save the active Codex session, switch accounts, rename labels, favorite profiles, delete profiles, and repair local storage. |
 | Monitor usage | View remaining usage, usage meters, aggregate status, warnings, and refresh state for each profile. |
 | Find profiles quickly | Search, filter by usage or favorites, reorder profiles, use keyboard navigation, and open a detached panel. |
 | Import and export | Preview profile bundles before writing them to `~/.codex`, then import or export portable JSON files. |
 | Notifications and automation | Receive low-usage alerts and optionally switch to a healthier saved profile when usage is depleted. |
-| Optional proxy | Run a loopback proxy with an OpenAI-compatible `/v1` endpoint that follows the active profile. |
+| Optional proxy | Switch accounts without restarting Codex or the app through an OpenAI-compatible local `/v1` endpoint. |
 | Customization | Choose the theme, compact layout, refresh interval, notification settings, accent color, and launch-at-login behavior. |
 
 ## Requirements
@@ -51,7 +51,7 @@ swift run
 ```
 
 3. Use **Add Profile** to sign in and save another Codex account, or use **Save Current** to store the session that is already active.
-4. Select a saved profile to switch accounts. If the proxy is disabled, reopen Codex before starting a new chat with the switched account.
+4. Select a saved profile to switch accounts. With the proxy enabled, the switch takes effect without restarting Codex or the app. Without the proxy, reopen Codex before starting a new chat with the switched account.
 
 You can also open `Package.swift` in Xcode and run the `CodexProfilesBar` executable target.
 
@@ -69,7 +69,7 @@ Profile credentials remain in the local Codex directory. Imported profiles are p
 
 ## Model Proxy
 
-The Proxy tab can start a local proxy bound to `127.0.0.1`. By default it exposes:
+The Proxy tab can start a local proxy bound to `127.0.0.1`. It lets you switch between saved Codex accounts without restarting Codex or Codex Profiles Bar. By default it exposes:
 
 ```text
 http://127.0.0.1:20263/v1
