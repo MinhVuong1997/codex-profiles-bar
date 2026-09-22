@@ -18,16 +18,26 @@ Codex Profiles Bar works directly with the local `~/.codex` storage used by Code
 
 The app is a standalone SwiftUI executable package with no external Swift package dependencies.
 
+Current release: **2.0.4**.
+
+## What's New in 2.0.4
+
+- Manual refresh requests are queued behind an active refresh so the profile list catches up reliably.
+- Profile cards have a cleaner layout, name-only tooltips, improved accessibility labels, and safer accent-color contrast.
+- Removed the Session Thread Copy workflow and profile sparkline charts.
+- Added an in-app exit confirmation and cleaned up unnecessary UI descriptions.
+
 ## Features
 
 | Area | Details |
 | --- | --- |
 | Profile management | Save the active Codex session, switch profiles, rename labels, clear labels, delete profiles, and repair local storage. |
-| Usage visibility | Inspect remaining usage, usage history, aggregate stats, warning states, and refresh status from the app UI. |
+| Usage visibility | Inspect remaining usage, usage meters, aggregate stats, warning states, and refresh status from the app UI. |
 | Search and organization | Search profiles, filter by usage or favorites, reorder saved profiles, and open a detached panel view. |
 | Import and export | Preview imported bundles before writing to `~/.codex`, then import or export portable JSON profile bundles. |
 | Alerts | Enable low-usage notifications, review the notification inbox, and optionally auto-switch when a profile is close to depletion. |
 | Model proxy | Run an optional loopback proxy that follows the active profile and exposes an OpenAI-compatible `/v1` endpoint. |
+| UI and accessibility | Use name-only profile tooltips, keyboard navigation, quick switch, accessible labels, and contrast-aware accent colors. |
 | Settings | Configure theme, compact mode, usage refresh behavior, notifications, accent color, proxy settings, and launch at login. |
 | Packaging | Build a signed local `.app` bundle and `.dmg` installer from scripts in this repo. |
 
