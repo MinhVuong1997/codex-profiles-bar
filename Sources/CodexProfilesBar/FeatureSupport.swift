@@ -296,6 +296,23 @@ extension ProfileStatus {
         primaryUsageBucket?.displayRemainingPercent
     }
 
+    var contentIdentity: String {
+        let usageIdentity = usage.map { snapshot in
+            let bucket = snapshot.buckets.first
+            return "\(snapshot.state):\(bucket?.fiveHour?.leftPercent ?? -1):\(bucket?.weekly?.leftPercent ?? -1)"
+        } ?? "none"
+        return [
+            stableID,
+            isCurrent ? "current" : "saved",
+            plan ?? "",
+            email ?? "",
+            label ?? "",
+            usageIdentity,
+            error?.summary.message ?? "",
+            statusLabel,
+        ].joined(separator: "|")
+    }
+
     var usageLimitPercent: Int? {
         primaryUsageBucket?.effectiveRemainingPercent
     }

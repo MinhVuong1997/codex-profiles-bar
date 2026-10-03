@@ -12,6 +12,7 @@ enum Preferences {
     static let notificationsEnabledKey = "CodexProfilesBar.notificationsEnabled"
     static let usageWarningThresholdKey = "CodexProfilesBar.usageWarningThreshold"
     static let autoSwitchOnDepletionKey = "CodexProfilesBar.autoSwitchOnDepletion"
+    static let autoSwitchThresholdKey = "CodexProfilesBar.autoSwitchThreshold"
     static let switchWhenCodexClosesKey = "CodexProfilesBar.switchWhenCodexCloses"
     static let switchWhenCodexClosesProfileIDKey = "CodexProfilesBar.switchWhenCodexClosesProfileID"
     static let accentRedKey = "CodexProfilesBar.accentRed"
@@ -720,9 +721,24 @@ enum CodexProfilesError: LocalizedError {
 }
 
 extension UsageWindow {
-    func relativeResetText(referenceDate: Date = .now) -> String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: Date(timeIntervalSince1970: TimeInterval(resetAt)), relativeTo: referenceDate)
+    func countdownText(at now: Date) -> String {
+        let remaining = Int(Date(timeIntervalSince1970: TimeInterval(resetAt)).timeIntervalSince(now).rounded(.down))
+        if remaining <= 0 { return "now" }
+
+        let days = remaining / 86_400
+        let hours = (remaining % 86_400) / 3_600
+        let minutes = (remaining % 3_600) / 60
+        let seconds = remaining % 60
+
+        if days > 0 {
+            return "\(days)d \(hours)h \(minutes)m"
+        }
+        if hours > 0 {
+            return String(format: "%dh %dm %02ds", hours, minutes, seconds)
+        }
+        if minutes > 0 {
+            return String(format: "%dm %02ds", minutes, seconds)
+        }
+        return "\(seconds)s"
     }
 }

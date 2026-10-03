@@ -51,7 +51,10 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private let service = CodexProfilesService.shared
     private let modelProxyServer = CodexModelProxyServer()
     private let launchAtLoginManager = LaunchAtLoginManager()
-    private let notificationCenter = UNUserNotificationCenter.current()
+    private var notificationCenter: UNUserNotificationCenter? {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return nil }
+        return UNUserNotificationCenter.current()
+    }
     private let activeProfileRefreshInterval: Duration = .seconds(20)
     private let proxyRefreshDebounce: Duration = .seconds(1)
     private let fileManager = FileManager.default
@@ -68,6 +71,9 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private var proxyRefreshTask: Task<Void, Never>?
     private var switchReconcileTask: Task<Void, Never>?
     private var refreshWaiters: [CheckedContinuation<Void, Never>] = []
+    private var queuedRefreshRequest: PendingRefreshRequest?
+    private var inFlightRefresh: PendingRefreshRequest?
+    private var refreshPassGeneration = 0
     private var codexLoginProcess: Process?
     private var isCodexLoginCancelled = false
     private var favorites: [String]
@@ -84,6 +90,11 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private struct PendingModelProxyRuntimeSettings {
         let contextWindow: Int?
         let autoCompactTokenLimit: Int?
+    }
+
+    private struct PendingRefreshRequest {
+        let trigger: RefreshTrigger
+        let scope: RefreshScope
     }
     override init() {
         let storedAutoRefresh = UserDefaults.standard.object(forKey: Preferences.autoRefreshKey) as? Bool
@@ -162,6 +173,11 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     var notificationThreshold: Int {
         let stored = UserDefaults.standard.integer(forKey: Preferences.usageWarningThresholdKey)
         return stored == 0 ? 10 : stored
+    }
+
+    var autoSwitchThreshold: Int {
+        let stored = UserDefaults.standard.integer(forKey: Preferences.autoSwitchThresholdKey)
+        return min(30, max(0, stored))
     }
 
     var currentProfile: ProfileStatus? {
@@ -459,11 +475,26 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func performRefresh(trigger: RefreshTrigger, scope: RefreshScope) async {
         if isRefreshingProfiles {
-            guard trigger != .automatic else { return }
+            if trigger == .automatic {
+                // Only an automatic full refresh can be holding a snapshot from before the
+                // active account changed. A manual or mutation refresh already reads current auth.
+                if scope == .activeProfile,
+                   inFlightRefresh?.trigger == .automatic,
+                   inFlightRefresh?.scope != .activeProfile {
+                    enqueueRefresh(PendingRefreshRequest(trigger: trigger, scope: scope))
+                }
+                return
+            }
+            let generationAtQueue = refreshPassGeneration
+            enqueueRefresh(PendingRefreshRequest(trigger: trigger, scope: scope))
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 refreshWaiters.append(continuation)
             }
-            await performRefresh(trigger: trigger, scope: scope)
+            // The in-flight refresh can finish its last pass before this request is visible.
+            // If no pass completed after we queued, publish this refresh ourselves.
+            if refreshPassGeneration == generationAtQueue {
+                await performRefresh(trigger: trigger, scope: scope)
+            }
             return
         }
         if trigger == .automatic && isLoading {
@@ -471,12 +502,12 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
 
         isRefreshingProfiles = true
-        if trigger != .automatic {
-            isLoading = true
-        }
+        var request = PendingRefreshRequest(trigger: trigger, scope: scope)
+        var managesLoadingState = trigger != .automatic
         defer {
             isRefreshingProfiles = false
-            if trigger != .automatic {
+            inFlightRefresh = nil
+            if managesLoadingState {
                 isLoading = false
             }
             let waiters = refreshWaiters
@@ -484,6 +515,23 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             waiters.forEach { $0.resume() }
         }
 
+        while true {
+            inFlightRefresh = request
+            if request.trigger != .automatic {
+                isLoading = true
+            }
+            await performRefreshPass(trigger: request.trigger, scope: request.scope)
+            refreshPassGeneration &+= 1
+            inFlightRefresh = nil
+
+            guard let nextRequest = queuedRefreshRequest else { break }
+            queuedRefreshRequest = nil
+            request = nextRequest
+            managesLoadingState = managesLoadingState || request.trigger != .automatic
+        }
+    }
+
+    private func performRefreshPass(trigger: RefreshTrigger, scope: RefreshScope) async {
         do {
             var canPersistUsageHistory = false
             switch scope {
@@ -491,13 +539,13 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
                 let (activeProfile, storage) = try await service.fetchActiveProfile()
                 detectedStorage = storage
                 canPersistUsageHistory = loadUsageHistoryIfNeeded(storage: storage)
-                mergeActiveProfile(profilePreservingTransientUsage(activeProfile))
+                mergeActiveProfile(profileForRefresh(activeProfile, trigger: trigger, scope: .activeProfile))
                 lastRefresh = .now
             case .allProfiles:
                 let (response, storage) = try await service.fetchProfiles()
                 detectedStorage = storage
                 canPersistUsageHistory = loadUsageHistoryIfNeeded(storage: storage)
-                profiles = sortProfiles(profilesPreservingTransientUsage(response.profiles))
+                profiles = sortProfiles(response.profiles.map { profileForRefresh($0, trigger: trigger, scope: .allProfiles) })
                 lastRefresh = .now
                 refreshLaunchAtLoginState()
             }
@@ -938,11 +986,11 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
 
         var updatedProfiles = profiles.map { profile in
-            if profile.stableID == activeProfile.stableID || (profile.isCurrent && activeProfile.isCurrent) {
+            if profile.stableID == activeProfile.stableID {
                 return activeProfile
             }
 
-            if profile.isCurrent && profile.stableID != activeProfile.stableID {
+            if profile.isCurrent {
                 return ProfileStatus(
                     id: profile.id,
                     label: profile.label,
@@ -968,8 +1016,22 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         updateSmartSwitchRecommendation()
     }
 
-    private func profilesPreservingTransientUsage(_ incomingProfiles: [ProfileStatus]) -> [ProfileStatus] {
-        incomingProfiles.map(profilePreservingTransientUsage)
+    private func enqueueRefresh(_ request: PendingRefreshRequest) {
+        if let queuedRefreshRequest,
+           queuedRefreshRequest.scope == .allProfiles,
+           request.scope == .activeProfile {
+            return
+        }
+        queuedRefreshRequest = request
+    }
+
+    private func profileForRefresh(
+        _ incomingProfile: ProfileStatus,
+        trigger: RefreshTrigger,
+        scope: RefreshScope
+    ) -> ProfileStatus {
+        guard trigger == .automatic, scope == .allProfiles else { return incomingProfile }
+        return profilePreservingTransientUsage(incomingProfile)
     }
 
     private func profilePreservingTransientUsage(_ incomingProfile: ProfileStatus) -> ProfileStatus {
@@ -1032,7 +1094,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func matchingExistingProfile(for incomingProfile: ProfileStatus) -> ProfileStatus? {
         profiles.first { profile in
-            profile.stableID == incomingProfile.stableID || (profile.isCurrent && incomingProfile.isCurrent)
+            profile.stableID == incomingProfile.stableID
         }
     }
 
@@ -1087,39 +1149,11 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
 
     private func reconcileProfilesAfterSwitch(mode: SwitchMode) async {
         if Task.isCancelled { return }
-
         if mode == .saveThenSwitch {
-            do {
-                let (response, storage) = try await service.fetchProfiles()
-                guard !Task.isCancelled else { return }
-                profiles = sortProfiles(profilesPreservingTransientUsage(response.profiles))
-                detectedStorage = storage
-                lastRefresh = .now
-                refreshLaunchAtLoginState()
-                return
-            } catch {
-                return
-            }
+            await refresh(trigger: .mutation)
+            return
         }
-
-        do {
-            let (activeProfile, storage) = try await service.fetchActiveProfile()
-            guard !Task.isCancelled else { return }
-            mergeActiveProfile(profilePreservingTransientUsage(activeProfile))
-            detectedStorage = storage
-            lastRefresh = .now
-        } catch {
-            do {
-                let (response, storage) = try await service.fetchProfiles()
-                guard !Task.isCancelled else { return }
-                profiles = sortProfiles(profilesPreservingTransientUsage(response.profiles))
-                detectedStorage = storage
-                lastRefresh = .now
-                refreshLaunchAtLoginState()
-            } catch {
-                return
-            }
-        }
+        await refreshActiveProfile(trigger: .mutation)
     }
 
     private func startModelProxy(shouldShowBanner: Bool) async {
@@ -1421,7 +1455,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private func requestNotificationAuthorizationIfNeeded() async {
         let notificationsEnabled = UserDefaults.standard.object(forKey: Preferences.notificationsEnabledKey) as? Bool ?? true
         guard notificationsEnabled else { return }
-        _ = try? await notificationCenter.requestAuthorization(options: [.alert, .sound, .badge])
+        _ = try? await notificationCenter?.requestAuthorization(options: [.alert, .sound, .badge])
     }
 
     private func installNotificationActionObserver() {
@@ -1926,28 +1960,32 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
     private func autoSwitchIfNeeded() async {
         let autoSwitchEnabled = UserDefaults.standard.object(forKey: Preferences.autoSwitchOnDepletionKey) as? Bool ?? false
         guard autoSwitchEnabled, !isPerformingAutomaticSwitch else { return }
-        guard let current = profiles.first(where: \.isCurrent), current.isUsageDepleted else { return }
+        let threshold = autoSwitchThreshold
+        guard let current = profiles.first(where: \.isCurrent), current.isLowUsage(threshold: threshold) else { return }
 
-        guard let fallback = bestAutoSwitchFallback() else {
+        guard let fallback = bestAutoSwitchFallback(minimumRemainingPercent: threshold) else {
             return
         }
 
         isPerformingAutomaticSwitch = true
         defer { isPerformingAutomaticSwitch = false }
 
+        let reason = threshold == 0
+            ? "the current profile ran out of usage"
+            : "the current profile dropped to \(threshold)% or below"
         let switched = await switchToProfile(
             fallback,
             mode: .standard,
             shouldPromptReopen: false,
             successTitle: "Auto-switched profile",
-            successBody: "Switched to \(fallback.primaryText) because the current profile ran out of usage."
+            successBody: "Switched to \(fallback.primaryText) because \(reason)."
         )
 
         if switched {
             await scheduleNotification(
                 identifier: "auto-switch-\(fallback.stableID)",
                 title: "Codex profile auto-switched",
-                body: "Now using \(fallback.primaryText) because the previous profile was depleted.",
+                body: "Now using \(fallback.primaryText) because \(reason).",
                 inboxTone: .success
             )
         }
@@ -1980,9 +2018,12 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
         }
     }
 
-    private func bestAutoSwitchFallback() -> ProfileStatus? {
+    private func bestAutoSwitchFallback(minimumRemainingPercent: Int = 0) -> ProfileStatus? {
         savedProfiles
-            .filter { !$0.isCurrent && $0.canSwitch && $0.hasRemainingUsage }
+            .filter { profile in
+                guard !profile.isCurrent, profile.canSwitch else { return false }
+                return (profile.usageLimitPercent ?? 0) > minimumRemainingPercent
+            }
             .max(by: { ($0.usageLimitPercent ?? 0) < ($1.usageLimitPercent ?? 0) })
     }
 
@@ -2022,7 +2063,7 @@ final class CodexProfilesViewModel: NSObject, ObservableObject {
             trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
         )
 
-        try? await notificationCenter.add(request)
+        try? await notificationCenter?.add(request)
     }
 
     private func importNotificationBody(

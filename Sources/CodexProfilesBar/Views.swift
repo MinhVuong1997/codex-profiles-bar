@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 struct MenuBarRootView: View {
     @ObservedObject var model: CodexProfilesViewModel
+    @ObservedObject private var resetClock = ResetClock.shared
     var isDetached = false
     let resolvedColorScheme: ColorScheme
     @AppStorage(Preferences.showIDsKey) private var showIDs = false
@@ -51,11 +52,12 @@ struct MenuBarRootView: View {
         PanelPalette.resolve(for: resolvedColorScheme, accent: Color(red: accentRed, green: accentGreen, blue: accentBlue))
     }
 
-    private var grouping: ProfileGrouping {
+    private     var grouping: ProfileGrouping {
         ProfileGrouping(rawValue: groupingRaw) ?? .none
     }
 
     var body: some View {
+        let _ = resetClock.now
         ZStack {
             LinearGradient(
                 colors: [palette.backgroundStart, palette.backgroundEnd],
@@ -447,18 +449,14 @@ struct MenuBarRootView: View {
                     }
                     .disabled(model.isLoading || isPreparingImportPreview || isExportingAll)
                 } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: isExportingAll ? "arrow.clockwise" : "ellipsis.circle")
-                            .font(.system(size: 12, weight: .semibold))
-                        Text("More")
-                            .font(.system(.caption, design: .rounded, weight: .bold))
-                            .lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity, minHeight: 18)
+                    Image(systemName: isExportingAll ? "arrow.clockwise" : "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 28, height: 18)
                 }
                 .menuStyle(.button)
                 .buttonStyle(ActionPillButtonStyle())
-                .help("More profile actions")
+                .fixedSize(horizontal: true, vertical: false)
+                .help("Export and doctor")
                 .accessibilityLabel("More profile actions")
                 .disabled((model.isLoading && !isExportingAll) || isPreparingImportPreview)
             }
@@ -582,7 +580,7 @@ struct MenuBarRootView: View {
 
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(spacing: 12) {
+                        VStack(spacing: 12) {
                             Color.clear
                                 .frame(height: 1)
                                 .id(scrollTopAnchorID)
@@ -592,7 +590,7 @@ struct MenuBarRootView: View {
                                     profile: currentProfile,
                                     showID: showIDs,
                                     isFavorite: model.isFavorite(currentProfile),
-                                    healthBadges: healthBadges(for: currentProfile),
+                                    healthBadges: healthBadges(for: currentProfile).filter { $0.title != "Active" },
                                     recommendation: model.recommendedSwitch,
                                     onToggleFavorite: {
                                         model.toggleFavorite(currentProfile)
@@ -610,10 +608,7 @@ struct MenuBarRootView: View {
                                         }
                                     }
                                 )
-                            }
-
-                            if let aggregateUsage = model.aggregateUsage {
-                                AggregateUsageCard(summary: aggregateUsage, palette: palette)
+                                .id(currentProfile.contentIdentity)
                             }
 
                             if bulkSelectionMode {
@@ -653,7 +648,7 @@ struct MenuBarRootView: View {
                                             .padding(.top, 4)
                                     }
 
-                                    ForEach(group.profiles, id: \.stableID) { profile in
+                                    ForEach(group.profiles, id: \.contentIdentity) { profile in
                                         ProfileCard(
                                             profile: profile,
                                             showID: showIDs,
@@ -1407,9 +1402,32 @@ struct MenuBarRootView: View {
     }
 
     private var filterBarHeader: some View {
-        filterBar
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.bottom, 8)
+        VStack(alignment: .leading, spacing: 8) {
+            filterBar
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let aggregateUsage = model.aggregateUsage {
+                aggregateUsageLine(aggregateUsage)
+            }
+        }
+        .padding(.bottom, 8)
+    }
+
+    private func aggregateUsageLine(_ summary: AggregateUsageSummary) -> some View {
+        HStack(spacing: 6) {
+            Text("5h \(summary.totalFiveHourPercent)%")
+            Text("·")
+            Text("Weekly \(summary.totalWeeklyPercent)%")
+            Text("·")
+            Text("Avg \(summary.averageFiveHourPercent)%")
+            Spacer(minLength: 8)
+            if summary.lowProfilesCount > 0 {
+                Text("\(summary.lowProfilesCount) low")
+                    .foregroundStyle(palette.warning)
+            }
+        }
+        .font(.system(.caption, design: .rounded, weight: .semibold))
+        .foregroundStyle(palette.secondaryText)
+        .lineLimit(1)
     }
 
     private var filterCountBadge: some View {
@@ -1812,9 +1830,6 @@ struct ProfileCard: View {
                         if !isBulkMode {
                             Menu {
                                 if profile.isSaved {
-                                    Button(isFavorite ? "Remove favorite" : "Add favorite", systemImage: isFavorite ? "star.slash" : "star") {
-                                        onToggleFavorite()
-                                    }
                                     Button("Edit label", systemImage: "pencil") {
                                         onEditLabel()
                                     }
@@ -2054,6 +2069,10 @@ struct ActiveProfileSpotlightCard: View {
         PanelPalette.resolve(for: colorScheme)
     }
 
+    private var showsStatusLine: Bool {
+        profile.error != nil || !profile.warnings.isEmpty || (profile.isCurrent && !profile.isSaved)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 12) {
@@ -2075,9 +2094,11 @@ struct ActiveProfileSpotlightCard: View {
                                 .background(palette.success.opacity(0.12), in: Capsule())
                         }
                     }
-                    Text(profile.statusLabel)
-                        .font(.system(.subheadline, design: .rounded, weight: .medium))
-                        .foregroundStyle(palette.secondaryText)
+                    if showsStatusLine {
+                        Text(profile.statusLabel)
+                            .font(.system(.subheadline, design: .rounded, weight: .medium))
+                            .foregroundStyle(palette.secondaryText)
+                    }
                     if !healthBadges.isEmpty {
                         HealthBadgesRow(badges: healthBadges, palette: palette)
                     }
@@ -2121,30 +2142,29 @@ struct ActiveProfileSpotlightCard: View {
             }
 
             if let recommendation {
-                HStack(alignment: .center, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Smart switch recommendation")
-                            .font(.system(.caption, design: .monospaced, weight: .bold))
-                            .foregroundStyle(palette.accent)
-                        Text("\(recommendation.profileName) has \(recommendation.usagePercent)% remaining.")
-                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Smart switch")
+                        .font(.system(.caption, design: .monospaced, weight: .bold))
+                        .foregroundStyle(palette.accent)
+                    HStack(spacing: 10) {
+                        Text(recommendation.profileName)
+                            .font(.system(.subheadline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text(recommendation.reason)
-                            .font(.system(.caption, design: .rounded))
-                            .foregroundStyle(palette.secondaryText)
-                    }
-
-                    Spacer()
-
-                    Button {
-                        onSwitchRecommended()
-                    } label: {
-                        Text("Switch to backup")
+                            .lineLimit(1)
+                        Text("\(recommendation.usagePercent)%")
                             .font(.system(.caption, design: .rounded, weight: .bold))
+                            .foregroundStyle(palette.success)
+                        Spacer(minLength: 8)
+                        Button(action: onSwitchRecommended) {
+                            Text("Switch")
+                                .font(.system(.caption, design: .rounded, weight: .bold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
                     }
-                    .buttonStyle(.borderedProminent)
                 }
                 .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .background(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(palette.subtleFill)
@@ -2221,69 +2241,6 @@ struct SearchField: View {
     }
 }
 
-struct AggregateUsageCard: View {
-    let summary: AggregateUsageSummary
-    let palette: PanelPalette
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Aggregate Usage")
-                        .font(.system(.headline, design: .rounded, weight: .bold))
-                        .foregroundStyle(palette.primaryText)
-                    Text("\(summary.trackedProfilesCount) profiles tracked • \(summary.favoritesCount) favorites")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(palette.secondaryText)
-                }
-
-                Spacer()
-
-                if summary.lowProfilesCount > 0 {
-                    Text("\(summary.lowProfilesCount) low")
-                        .font(.system(.caption, design: .rounded, weight: .bold))
-                        .foregroundStyle(palette.warning)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(palette.warning.opacity(0.14), in: Capsule())
-                }
-            }
-
-            HStack(spacing: 10) {
-                aggregateMetric(title: "5h total", value: "\(summary.totalFiveHourPercent)%", tint: palette.accent)
-                aggregateMetric(title: "Weekly total", value: "\(summary.totalWeeklyPercent)%", tint: palette.success)
-                aggregateMetric(title: "Avg 5h", value: "\(summary.averageFiveHourPercent)%", tint: palette.secondaryText)
-            }
-        }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(palette.cardFill)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(palette.cardStroke, lineWidth: 1)
-                )
-        )
-    }
-
-    private func aggregateMetric(title: String, value: String, tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(palette.secondaryText)
-            Text(value)
-                .font(.system(.headline, design: .rounded, weight: .bold))
-                .foregroundStyle(tint)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(palette.subtleFill)
-        )
-    }
-}
-
 struct QuickSwitchOverlay: View {
     @Binding var query: String
     let profiles: [ProfileStatus]
@@ -2319,7 +2276,7 @@ struct QuickSwitchOverlay: View {
 
                 ScrollView {
                     VStack(spacing: 8) {
-                        ForEach(Array(profiles.enumerated()), id: \.element.stableID) { index, profile in
+                        ForEach(Array(profiles.enumerated()), id: \.element.contentIdentity) { index, profile in
                             Button {
                                 onChoose(profile)
                             } label: {
@@ -3409,6 +3366,7 @@ struct SettingsView: View {
     @AppStorage(Preferences.switchWhenCodexClosesKey) private var switchWhenCodexCloses = false
     @AppStorage(Preferences.switchWhenCodexClosesProfileIDKey) private var switchWhenCodexClosesProfileID = ""
     @AppStorage(Preferences.usageWarningThresholdKey) private var usageWarningThreshold = 10
+    @AppStorage(Preferences.autoSwitchThresholdKey) private var autoSwitchThreshold = 0
     @AppStorage(Preferences.accentRedKey) private var accentRed = 0.15
     @AppStorage(Preferences.accentGreenKey) private var accentGreen = 0.44
     @AppStorage(Preferences.accentBlueKey) private var accentBlue = 0.95
@@ -3707,15 +3665,27 @@ struct SettingsView: View {
 
                 Toggle(isOn: $autoSwitchOnDepletion) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Auto-switch when current profile is depleted")
+                        Text("Auto-switch when usage drops")
                             .font(.system(.headline, design: .rounded, weight: .semibold))
                             .foregroundStyle(palette.primaryText)
-                        Text("Automatically moves to the saved profile with the highest remaining usage.")
+                        Text("Moves to the saved profile with the highest remaining usage once the current profile reaches the threshold.")
                             .font(.system(.caption, design: .rounded))
                             .foregroundStyle(palette.secondaryText)
                     }
                 }
                 .toggleStyle(.switch)
+
+                if autoSwitchOnDepletion {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Auto-switch threshold: \(autoSwitchThreshold)%")
+                            .font(.system(.headline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+                        Slider(value: Binding(
+                            get: { Double(autoSwitchThreshold) },
+                            set: { autoSwitchThreshold = Int($0.rounded()) }
+                        ), in: 0...30, step: 1)
+                    }
+                }
 
                 Toggle(isOn: $switchWhenCodexCloses) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -3977,11 +3947,30 @@ struct CommandSnippet: View {
     }
 }
 
+@MainActor
+private final class ResetClock: ObservableObject {
+    static let shared = ResetClock()
+
+    @Published private(set) var now = Date()
+    private var timer: Timer?
+
+    private init() {
+        let timer = Timer(timeInterval: 1, repeats: true) { _ in
+            Task { @MainActor in
+                ResetClock.shared.now = Date()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+}
+
 struct UsageMeterRow: View {
     let title: String
     let windowTitle: String
     let window: UsageWindow?
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var clock = ResetClock.shared
 
     private var palette: PanelPalette {
         PanelPalette.resolve(for: colorScheme)
@@ -3997,9 +3986,10 @@ struct UsageMeterRow: View {
                     .foregroundStyle(palette.secondaryText)
                 Spacer()
                 if let window {
-                    Text("\(percent)% left · resets \(window.relativeResetText())")
+                    Text("\(percent)% left · resets \(window.countdownText(at: clock.now))")
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(palette.tertiaryText)
+                        .monospacedDigit()
                 } else {
                     Text("No \(title.lowercased()) data")
                         .font(.system(.caption2, design: .monospaced))
