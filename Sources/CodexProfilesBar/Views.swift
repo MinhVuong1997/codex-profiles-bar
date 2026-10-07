@@ -4,7 +4,6 @@ import UniformTypeIdentifiers
 
 struct MenuBarRootView: View {
     @ObservedObject var model: CodexProfilesViewModel
-    @ObservedObject private var resetClock = ResetClock.shared
     var isDetached = false
     let resolvedColorScheme: ColorScheme
     @AppStorage(Preferences.showIDsKey) private var showIDs = false
@@ -57,7 +56,6 @@ struct MenuBarRootView: View {
     }
 
     var body: some View {
-        let _ = resetClock.now
         ZStack {
             LinearGradient(
                 colors: [palette.backgroundStart, palette.backgroundEnd],
@@ -3970,7 +3968,6 @@ struct UsageMeterRow: View {
     let windowTitle: String
     let window: UsageWindow?
     @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var clock = ResetClock.shared
 
     private var palette: PanelPalette {
         PanelPalette.resolve(for: colorScheme)
@@ -3986,10 +3983,7 @@ struct UsageMeterRow: View {
                     .foregroundStyle(palette.secondaryText)
                 Spacer()
                 if let window {
-                    Text("\(percent)% left · resets \(window.countdownText(at: clock.now))")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(palette.tertiaryText)
-                        .monospacedDigit()
+                    ResetCountdownLabel(percent: percent, window: window, foreground: palette.tertiaryText)
                 } else {
                     Text("No \(title.lowercased()) data")
                         .font(.system(.caption2, design: .monospaced))
@@ -4017,6 +4011,20 @@ struct UsageMeterRow: View {
             }
             .frame(height: 7)
         }
+    }
+}
+
+private struct ResetCountdownLabel: View {
+    let percent: Int
+    let window: UsageWindow
+    let foreground: Color
+    @ObservedObject private var clock = ResetClock.shared
+
+    var body: some View {
+        Text("\(percent)% left · resets \(window.countdownText(at: clock.now))")
+            .font(.system(.caption2, design: .monospaced))
+            .foregroundStyle(foreground)
+            .monospacedDigit()
     }
 }
 
